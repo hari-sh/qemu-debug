@@ -1,0 +1,684 @@
+import * as vscode from 'vscode';
+import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as path from 'path';
+import treeKill = require('tree-kill');
+import { MIObject, MIParser, MIRecord, MIValue } from './mi';
+
+type Config = vscode.DebugConfiguration & {
+  elfFile?: string;
+  qemuPath?: string;
+  gdbPath?: string;
+  gdbPort?: number;
+  machine?: string;
+  buildCommand?: string;
+  ledRegister?: string;
+  stopOnEntry?: boolean;
+};
+
+interface DAPRequest {
+  seq: number;
+  type: string;
+  command: string;
+  arguments?: any;
+}
+
+const REG_SCOPE_REF = 1;
+const LOCALS_SCOPE_REF = 2;
+const LEDS_SCOPE_REF = 3;
+
+/**
+ * Debug Adapter for QEMU Cortex-M3 targets driven over GDB/MI2.
+ */
+export class QemuDebugAdapter implements vscode.DebugAdapter {
+  private readonly emitter = new vscode.EventEmitter<vscode.DebugProtocolMessage>();
+  readonly onDidSendMessage = this.emitter.event;
+
+  private gdb?: cp.ChildProcessWithoutNullStreams;
+  private qemu?: cp.ChildProcess;
+  private parser = new MIParser();
+  private seq = 1;
+  private token = 1;
+  private pending = new Map<number, { resolve: (r: MIRecord) => void; reject: (err: Error) => void }>();
+  private cfg!: Config;
+  private root = process.cwd();
+  private status: 'Disconnected' | 'Building' | 'Attaching' | 'Running' | 'Stopped' = 'Disconnected';
+  private suppressStopped = false;
+  private stopWaiters: Array<() => void> = [];
+  private breakpointsByFile = new Map<string, number[]>();
+  private registerNames: string[] = [];
+  private activeFrameId = 0;
+  private terminated = false;
+  private disposed = false;
+
+  handleMessage(message: vscode.DebugProtocolMessage) {
+    const req = message as DAPRequest;
+    if (req.type === 'request') void this.request(req);
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.end();
+    this.emitter.dispose();
+  }
+
+  private send(type: string, payload: Record<string, any> = {}) {
+    if (this.disposed) return;
+    this.emitter.fire({ type, seq: this.seq++, ...payload } as unknown as vscode.DebugProtocolMessage);
+  }
+
+  private sendEvent(event: string, body?: Record<string, any>) {
+    this.send('event', body ? { event, body } : { event });
+  }
+
+  private reply(m: DAPRequest, body: Record<string, any> = {}) {
+    this.send('response', { request_seq: m.seq, success: true, command: m.command, body });
+  }
+
+  private logOutput(text: string, category: 'stdout' | 'stderr' | 'console' = 'console') {
+    if (!text) return;
+    this.sendEvent('output', { category, output: text });
+  }
+
+  private async request(m: DAPRequest) {
+    try {
+      switch (m.command) {
+        case 'initialize':
+          this.reply(m, {
+            supportsConfigurationDoneRequest: true,
+            supportsEvaluateForHovers: true,
+            supportsDisassembleRequest: true,
+            supportsSteppingGranularity: true,
+          });
+          break;
+        case 'launch':
+          this.cfg = m.arguments;
+          await this.start(false);
+          this.reply(m);
+          this.sendEvent('initialized');
+          break;
+        case 'attach':
+          this.cfg = m.arguments;
+          await this.start(true);
+          this.reply(m);
+          this.sendEvent('initialized');
+          break;
+        case 'configurationDone':
+          this.reply(m);
+          if (this.cfg.stopOnEntry === false) {
+            await this.mi('exec-continue');
+            this.status = 'Running';
+          } else {
+            this.stop('entry');
+          }
+          break;
+        case 'disconnect':
+          this.reply(m);
+          this.end();
+          break;
+        case 'threads':
+          this.reply(m, { threads: [{ id: 1, name: 'Cortex-M3' }] });
+          break;
+        case 'continue':
+          await this.mi('exec-continue');
+          this.status = 'Running';
+          this.reply(m, { allThreadsContinued: true });
+          break;
+        case 'pause':
+          this.interruptTarget();
+          this.reply(m);
+          break;
+        case 'next': {
+          const cmd = m.arguments?.granularity === 'instruction' ? 'exec-next-instruction' : 'exec-next';
+          await this.mi(cmd);
+          this.status = 'Running';
+          this.reply(m);
+          break;
+        }
+        case 'stepIn': {
+          const cmd = m.arguments?.granularity === 'instruction' ? 'exec-step-instruction' : 'exec-step';
+          await this.mi(cmd);
+          this.status = 'Running';
+          this.reply(m);
+          break;
+        }
+        case 'stepOut':
+          await this.mi('exec-finish');
+          this.status = 'Running';
+          this.reply(m);
+          break;
+        case 'setBreakpoints':
+          await this.handleSetBreakpoints(m);
+          break;
+        case 'stackTrace':
+          await this.handleStackTrace(m);
+          break;
+        case 'scopes':
+          this.activeFrameId = m.arguments?.frameId ?? 0;
+          this.reply(m, {
+            scopes: [
+              { name: 'Locals', variablesReference: LOCALS_SCOPE_REF, expensive: false },
+              { name: 'Registers', variablesReference: REG_SCOPE_REF, expensive: false },
+              { name: 'LEDs', variablesReference: LEDS_SCOPE_REF, expensive: false },
+            ],
+          });
+          break;
+        case 'variables':
+          await this.handleVariables(m);
+          break;
+        case 'evaluate':
+          await this.handleEvaluate(m);
+          break;
+        case 'disassemble':
+          await this.handleDisassemble(m);
+          break;
+        default:
+          this.reply(m);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logOutput(`${msg}\n`, 'stderr');
+      this.send('response', {
+        request_seq: m.seq,
+        success: false,
+        command: m.command,
+        message: msg,
+      });
+    }
+  }
+
+  private async start(attach: boolean) {
+    this.terminated = false;
+    this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+    const resolve = (s?: string) => s?.replace(/\$\{workspaceFolder\}/g, this.root);
+
+    this.cfg.elfFile = resolve(this.cfg.elfFile);
+    this.cfg.qemuPath = resolve(this.cfg.qemuPath) || this.findBinary('qemu-system-arm');
+    this.cfg.gdbPath = resolve(this.cfg.gdbPath) || this.findBinary('arm-none-eabi-gdb');
+    this.cfg.gdbPort ||= 3333;
+    this.cfg.machine ||= 'mps2-an385';
+
+    const env = this.buildEnv();
+
+    if (!attach && this.cfg.buildCommand) {
+      this.status = 'Building';
+      const cmd = resolve(this.cfg.buildCommand)!;
+      this.logOutput(`Building: ${cmd}\n`, 'console');
+      await this.runBuild(cmd, env);
+    }
+
+    if (this.cfg.elfFile && !fs.existsSync(this.cfg.elfFile)) {
+      throw new Error(`ELF file not found: ${this.cfg.elfFile}`);
+    }
+
+    if (!attach) {
+      const qemuArgs = [
+        '-M', this.cfg.machine,
+        '-cpu', 'cortex-m3',
+        '-display', 'none',
+        '-serial', 'null',
+        '-monitor', 'none',
+        '-S',
+        '-gdb', `tcp:127.0.0.1:${this.cfg.gdbPort}`,
+      ];
+      if (this.cfg.elfFile) {
+        qemuArgs.push('-kernel', this.cfg.elfFile);
+      }
+      await this.spawnQemu(this.cfg.qemuPath, qemuArgs, env);
+    } else {
+      this.status = 'Attaching';
+    }
+
+    this.spawnGdb(this.cfg.gdbPath, env);
+    this.suppressStopped = true;
+    try {
+      if (this.cfg.elfFile) {
+        await this.mi(`file-exec-and-symbols "${this.escapeMI(this.cfg.elfFile)}"`);
+      }
+      await this.mi(`target-select remote 127.0.0.1:${this.cfg.gdbPort}`);
+    } finally {
+      this.suppressStopped = false;
+    }
+
+    this.status = 'Stopped';
+  }
+
+  private buildEnv(): NodeJS.ProcessEnv {
+    const extraDirs = ['/opt/homebrew/bin', '/usr/local/bin'];
+    for (const bin of [this.cfg.qemuPath, this.cfg.gdbPath]) {
+      if (bin && path.isAbsolute(bin)) extraDirs.push(path.dirname(bin));
+    }
+    const existing = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+    const merged = [...new Set([...extraDirs, ...existing])];
+    return { ...process.env, PATH: merged.join(path.delimiter) };
+  }
+
+  private findBinary(name: string): string {
+    for (const dir of ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+
+  private runBuild(command: string, env: NodeJS.ProcessEnv): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const proc = cp.exec(command, { cwd: this.root, env }, (err) => {
+        if (err) reject(new Error(`Build failed: ${err.message}`));
+        else resolve();
+      });
+      proc.stdout?.on('data', (d) => this.logOutput(d.toString(), 'stdout'));
+      proc.stderr?.on('data', (d) => this.logOutput(d.toString(), 'stderr'));
+    });
+  }
+
+  private spawnQemu(qemuPath: string, args: string[], env: NodeJS.ProcessEnv): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let stderrBuf = '';
+      const qemu = cp.spawn(qemuPath, args, { cwd: this.root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      this.qemu = qemu;
+
+      qemu.stdout?.on('data', (d) => this.logOutput(d.toString(), 'stdout'));
+      qemu.stderr?.on('data', (d) => {
+        const text = d.toString();
+        stderrBuf += text;
+        this.logOutput(text, 'stderr');
+      });
+      qemu.on('error', (err) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Failed to start QEMU (${qemuPath}): ${err.message}`));
+        }
+      });
+      qemu.on('exit', (code, signal) => {
+        if (!settled) {
+          settled = true;
+          const detail = stderrBuf.trim() || `code=${code} signal=${signal}`;
+          reject(new Error(`QEMU exited unexpectedly: ${detail}`));
+        } else if (!this.terminated) {
+          this.logOutput(`QEMU exited (${code ?? signal})\n`, 'stderr');
+          this.end();
+        }
+      });
+
+      this.waitForPort(this.cfg.gdbPort!, 5000)
+        .then(() => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
+    });
+  }
+
+  private waitForPort(port: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+      const attempt = () => {
+        if (!this.qemu || this.qemu.exitCode !== null) {
+          reject(new Error('QEMU terminated before opening GDB port.'));
+          return;
+        }
+        const sock = net.createConnection({ host: '127.0.0.1', port });
+        sock.once('connect', () => {
+          sock.destroy();
+          resolve();
+        });
+        sock.once('error', () => {
+          sock.destroy();
+          if (Date.now() >= deadline) {
+            reject(new Error(`Timed out waiting for QEMU GDB server on port ${port}.`));
+          } else {
+            setTimeout(attempt, 50);
+          }
+        });
+      };
+      attempt();
+    });
+  }
+
+  private spawnGdb(gdbPath: string, env: NodeJS.ProcessEnv) {
+    const gdb = cp.spawn(gdbPath, ['--quiet', '--nx', '--interpreter=mi2'], { cwd: this.root, env });
+    this.gdb = gdb;
+    gdb.stdout.on('data', (d) => this.onMI(d.toString()));
+    gdb.stderr.on('data', (d) => this.logOutput(d.toString(), 'stderr'));
+    gdb.on('error', (err) => {
+      this.rejectAllPending(new Error(`Failed to start GDB (${gdbPath}): ${err.message}`));
+    });
+    gdb.on('exit', (code, signal) => {
+      this.rejectAllPending(new Error(`GDB exited (${code ?? signal})`));
+      if (!this.terminated) this.end();
+    });
+  }
+
+  private rejectAllPending(err: Error) {
+    for (const [, waiter] of this.pending) waiter.reject(err);
+    this.pending.clear();
+  }
+
+  private onMI(text: string) {
+    for (const r of this.parser.feed(text)) {
+      if (r.kind === 'result' && r.token && this.pending.has(r.token)) {
+        const waiter = this.pending.get(r.token)!;
+        this.pending.delete(r.token);
+        if (r.command === 'error') {
+          waiter.reject(new Error(this.asString(r.results.msg) || 'GDB error'));
+        } else {
+          waiter.resolve(r);
+        }
+      } else if (r.kind === 'exec') {
+        if (r.command === 'stopped') {
+          this.status = 'Stopped';
+          const waiters = this.stopWaiters.splice(0);
+          for (const w of waiters) w();
+          if (!this.suppressStopped) {
+            this.stop(this.mapStopReason(r.results));
+          }
+        } else if (r.command === 'running') {
+          this.status = 'Running';
+        }
+      } else if (r.kind === 'stream' && r.text) {
+        if (r.command === '&') {
+          this.logOutput(r.text, 'stderr');
+        } else if (r.command === '~' || r.command === '@') {
+          this.logOutput(r.text, 'console');
+        }
+      }
+    }
+  }
+
+  private mapStopReason(results: MIObject): string {
+    const reason = this.asString(results.reason);
+    switch (reason) {
+      case 'breakpoint-hit': return 'breakpoint';
+      case 'end-stepping-range':
+      case 'function-finished': return 'step';
+      case 'signal-received':
+        return this.asString(results['signal-name']) === 'SIGINT' ? 'pause' : 'exception';
+      default:
+        return 'pause';
+    }
+  }
+
+  private mi(command: string): Promise<MIRecord> {
+    if (!this.gdb || this.gdb.killed || this.gdb.exitCode !== null) {
+      return Promise.reject(new Error(`GDB is not running (command: ${command})`));
+    }
+    return new Promise((resolve, reject) => {
+      const t = this.token++;
+      this.pending.set(t, { resolve, reject });
+      this.gdb!.stdin.write(`${t}-${command}\n`);
+      setTimeout(() => {
+        if (this.pending.delete(t)) {
+          reject(new Error(`GDB timeout: ${command}`));
+        }
+      }, 10000);
+    });
+  }
+
+  private interruptTarget() {
+    if (this.gdb?.pid) {
+      try {
+        process.kill(this.gdb.pid, 'SIGINT');
+      } catch {
+        // Ignore if process already exited
+      }
+    }
+  }
+
+  private waitForStop(timeoutMs = 2000): Promise<void> {
+    if (this.status === 'Stopped') return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.stopWaiters.indexOf(onStop);
+        if (idx >= 0) this.stopWaiters.splice(idx, 1);
+        reject(new Error('Timed out waiting for target to halt.'));
+      }, timeoutMs);
+      const onStop = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.stopWaiters.push(onStop);
+    });
+  }
+
+  private async withTargetHalted<T>(fn: () => Promise<T>): Promise<T> {
+    const wasRunning = this.status === 'Running';
+    if (wasRunning) {
+      this.suppressStopped = true;
+      try {
+        this.interruptTarget();
+        await this.waitForStop();
+      } finally {
+        this.suppressStopped = false;
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      if (wasRunning && this.status === 'Stopped') {
+        await this.mi('exec-continue');
+        this.status = 'Running';
+      }
+    }
+  }
+
+  private async handleSetBreakpoints(m: DAPRequest) {
+    const sourcePath: string | undefined = m.arguments?.source?.path;
+    const requested: Array<{ line: number; condition?: string }> = m.arguments?.breakpoints || [];
+    if (!sourcePath) {
+      this.reply(m, { breakpoints: requested.map((b) => ({ line: b.line, verified: false })) });
+      return;
+    }
+
+    const resultBreakpoints = await this.withTargetHalted(async () => {
+      const prevIds = this.breakpointsByFile.get(sourcePath) || [];
+      if (prevIds.length > 0) {
+        try {
+          await this.mi(`break-delete ${prevIds.join(' ')}`);
+        } catch {
+          // Ignore already-deleted breakpoints
+        }
+      }
+
+      const newIds: number[] = [];
+      const out: Array<{ id?: number; line: number; verified: boolean; message?: string }> = [];
+      for (const b of requested) {
+        try {
+          const condFlag = b.condition ? `-c "${this.escapeMI(b.condition)}" ` : '';
+          const rec = await this.mi(`break-insert ${condFlag}"${this.escapeMI(sourcePath)}:${b.line}"`);
+          const bkpt = this.asObject(rec.results.bkpt);
+          const id = bkpt?.number ? Number(this.asString(bkpt.number)) : undefined;
+          const line = bkpt?.line ? Number(this.asString(bkpt.line)) : b.line;
+          if (id !== undefined && !Number.isNaN(id)) newIds.push(id);
+          out.push({ id, line, verified: true });
+        } catch (err) {
+          out.push({
+            line: b.line,
+            verified: false,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      this.breakpointsByFile.set(sourcePath, newIds);
+      return out;
+    });
+
+    this.reply(m, { breakpoints: resultBreakpoints });
+  }
+
+  private async handleStackTrace(m: DAPRequest) {
+    const rec = await this.mi('stack-list-frames');
+    const stackList = this.asArray(rec.results.stack);
+    const stackFrames = stackList.map((entry, idx) => {
+      const raw = this.asObject(entry);
+      const frame = raw?.frame ? this.asObject(raw.frame) : raw;
+      const fullname = this.asString(frame?.fullname) || this.asString(frame?.file);
+      const lineStr = this.asString(frame?.line);
+      const addr = this.asString(frame?.addr);
+      return {
+        id: frame?.level ? Number(this.asString(frame.level)) : idx,
+        name: this.asString(frame?.func) || addr || `frame #${idx}`,
+        source: fullname ? { name: path.basename(fullname), path: fullname } : undefined,
+        line: lineStr ? Number(lineStr) : 0,
+        column: 0,
+        instructionPointerReference: addr || undefined,
+      };
+    });
+    this.reply(m, { stackFrames, totalFrames: stackFrames.length });
+  }
+
+  private async handleVariables(m: DAPRequest) {
+    const ref: number = m.arguments?.variablesReference;
+    if (ref === REG_SCOPE_REF) {
+      if (this.registerNames.length === 0) {
+        const namesRec = await this.mi('data-list-register-names');
+        this.registerNames = this.asArray(namesRec.results['register-names']).map((v) => this.asString(v));
+      }
+      const valsRec = await this.mi('data-list-register-values x');
+      const vals = this.asArray(valsRec.results['register-values']);
+      const variables = vals
+        .map((item) => {
+          const obj = this.asObject(item);
+          const num = Number(this.asString(obj?.number));
+          const name = this.registerNames[num] || '';
+          const value = this.asString(obj?.value);
+          return { name, value, variablesReference: 0 };
+        })
+        .filter((v) => v.name.length > 0);
+      this.reply(m, { variables });
+      return;
+    }
+
+    if (ref === LEDS_SCOPE_REF) {
+      const addr = this.cfg.ledRegister || '0x40028000';
+      const variables = await this.readLedVariables(addr);
+      this.reply(m, { variables });
+      return;
+    }
+
+    const varsRec = await this.mi(`stack-list-variables --thread 1 --frame ${this.activeFrameId} --simple-values`);
+    const vars = this.asArray(varsRec.results.variables).map((item) => {
+      const obj = this.asObject(item);
+      return {
+        name: this.asString(obj?.name),
+        value: this.asString(obj?.value) || '{...}',
+        type: this.asString(obj?.type) || undefined,
+        variablesReference: 0,
+      };
+    });
+    this.reply(m, { variables: vars });
+  }
+
+  private async readLedVariables(addr: string) {
+    try {
+      const rec = await this.mi(`data-read-memory-bytes ${addr} 4`);
+      const mem = this.asObject(this.asArray(rec.results.memory)[0]);
+      const hex = this.asString(mem?.contents);
+      if (hex.length >= 8) {
+        const bytes = hex.match(/.{2}/g)!.map((b) => parseInt(b, 16));
+        const val = ((bytes[3] << 24) | (bytes[2] << 16) | (bytes[1] << 8) | bytes[0]) >>> 0;
+        return [
+          { name: `Register (${addr})`, value: `0x${val.toString(16).padStart(8, '0')}`, variablesReference: 0 },
+          ...[...Array(8)].map((_, i) => ({
+            name: `LED${i}`,
+            value: (val & (1 << i)) !== 0 ? 'ON' : 'OFF',
+            variablesReference: 0,
+          })),
+        ];
+      }
+    } catch {
+      // Fall through to unknown state
+    }
+    return [...Array(8)].map((_, i) => ({ name: `LED${i}`, value: 'unknown', variablesReference: 0 }));
+  }
+
+  private async handleEvaluate(m: DAPRequest) {
+    const expr = String(m.arguments?.expression ?? '').trim();
+    const frameId = m.arguments?.frameId ?? this.activeFrameId;
+    const context = m.arguments?.context;
+
+    if (context === 'repl' && expr.startsWith('>')) {
+      const cmd = expr.slice(1).trim();
+      await this.mi(`interpreter-exec console "${this.escapeMI(cmd)}"`);
+      this.reply(m, { result: '', variablesReference: 0 });
+      return;
+    }
+
+    try {
+      const rec = await this.mi(`data-evaluate-expression --thread 1 --frame ${frameId} "${this.escapeMI(expr)}"`);
+      this.reply(m, { result: this.asString(rec.results.value), variablesReference: 0 });
+    } catch (err) {
+      if (context === 'repl') {
+        await this.mi(`interpreter-exec console "${this.escapeMI(expr)}"`);
+        this.reply(m, { result: '', variablesReference: 0 });
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async handleDisassemble(m: DAPRequest) {
+    const baseRef = String(m.arguments?.memoryReference || '$pc');
+    const offset = Number(m.arguments?.offset || 0);
+    const count = Math.max(1, Number(m.arguments?.instructionCount || 32));
+    const startExpr = baseRef.startsWith('0x')
+      ? `0x${Math.max(0, parseInt(baseRef, 16) + offset).toString(16)}`
+      : baseRef;
+    const endExpr = startExpr.startsWith('0x')
+      ? `0x${(parseInt(startExpr, 16) + count * 4).toString(16)}`
+      : `${startExpr}+${count * 4}`;
+
+    const rec = await this.mi(`data-disassemble -s "${this.escapeMI(startExpr)}" -e "${this.escapeMI(endExpr)}" -- 0`);
+    const insns = this.asArray(rec.results.asm_insns).slice(0, count).map((item) => {
+      const obj = this.asObject(item);
+      return {
+        address: this.asString(obj?.address),
+        instruction: this.asString(obj?.inst).replace(/\t+/g, ' '),
+        symbol: this.asString(obj?.['func-name']) || undefined,
+      };
+    });
+    this.reply(m, { instructions: insns });
+  }
+
+  private stop(reason: string) {
+    this.status = 'Stopped';
+    this.sendEvent('stopped', { reason, threadId: 1, allThreadsStopped: true });
+  }
+
+  private end() {
+    if (this.terminated) return;
+    this.terminated = true;
+    this.rejectAllPending(new Error('Debug session terminated'));
+    if (this.gdb?.pid) treeKill(this.gdb.pid, 'SIGTERM', () => undefined);
+    if (this.qemu?.pid) treeKill(this.qemu.pid, 'SIGTERM', () => undefined);
+    this.gdb = undefined;
+    this.qemu = undefined;
+    this.status = 'Disconnected';
+    this.sendEvent('terminated');
+  }
+
+  private escapeMI(s: string): string {
+    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
+  private asString(v: MIValue | undefined): string {
+    return typeof v === 'string' ? v : '';
+  }
+
+  private asObject(v: MIValue | undefined): MIObject | undefined {
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : undefined;
+  }
+
+  private asArray(v: MIValue | undefined): MIValue[] {
+    return Array.isArray(v) ? v : [];
+  }
+}

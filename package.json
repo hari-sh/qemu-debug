@@ -1,0 +1,136 @@
+{
+  "name": "qemu-debug",
+  "displayName": "qemu-debug",
+  "description": "QEMU Cortex-M3 debugging for mps2-an385",
+  "version": "0.1.0",
+  "publisher": "qemu-debug",
+  "engines": {
+    "vscode": ">=1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onDebug"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "qemu-m3",
+        "label": "QEMU Cortex-M3",
+        "languages": [
+          "c",
+          "cpp",
+          "assembly"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "type",
+              "request",
+              "name",
+              "elfFile"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "request": {
+                "type": "string",
+                "enum": [
+                  "launch"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "elfFile": {
+                "type": "string"
+              },
+              "qemuPath": {
+                "type": "string"
+              },
+              "gdbPath": {
+                "type": "string"
+              },
+              "gdbPort": {
+                "type": "number"
+              },
+              "machine": {
+                "type": "string"
+              },
+              "buildCommand": {
+                "type": "string"
+              },
+              "ledRegister": {
+                "type": "string"
+              },
+              "stopOnEntry": {
+                "type": "boolean"
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "type",
+              "request",
+              "name"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "request": {
+                "type": "string",
+                "enum": [
+                  "attach"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "elfFile": {
+                "type": "string"
+              },
+              "gdbPath": {
+                "type": "string"
+              },
+              "gdbPort": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "qemu-m3",
+            "request": "launch",
+            "name": "Debug Firmware",
+            "elfFile": "${workspaceFolder}/build/firmware.elf",
+            "qemuPath": "/usr/bin/qemu-system-arm",
+            "gdbPath": "/usr/bin/arm-none-eabi-gdb",
+            "gdbPort": 3333,
+            "machine": "mps2-an385",
+            "buildCommand": "make -C ${workspaceFolder}",
+            "ledRegister": "0x40028000"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "test": "npm run compile"
+  },
+  "dependencies": {
+    "tree-kill": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
