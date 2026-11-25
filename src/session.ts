@@ -630,7 +630,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
       throw new Error('Target must be stopped before reading memory.');
     }
     const req = this.views?.getMemoryRequest();
-    const hex = await this.readMemoryHex(address, req?.byteCount ?? 40);
+    const hex = await this.readMemoryHex(address, req?.byteCount ?? 80);
     this.views?.setMemoryHex(address, hex);
   }
 
@@ -638,7 +638,14 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     if (this.status !== 'Stopped') {
       throw new Error('Target must be stopped before editing registers.');
     }
-    const cleanName = name.trim();
+    const aliases: Record<string, string> = {
+      ctrl: 'control',
+      pmask: 'primask',
+      fmask: 'faultmask',
+      bpri: 'basepri',
+    };
+    const trimmed = name.trim();
+    const cleanName = aliases[trimmed] || trimmed;
     if (!/^[a-zA-Z0-9_]+$/.test(cleanName)) {
       throw new Error(`Invalid register name: ${name}`);
     }

@@ -27,8 +27,15 @@ export interface ViewActionHandler {
 }
 
 const DEFAULT_MEMORY_ADDRESS = '0x00000000';
-const DEFAULT_MEMORY_WORDS = 10;
-const DEFAULT_MEMORY_BYTES = DEFAULT_MEMORY_WORDS * 4;
+const DEFAULT_MEMORY_ROWS = 10;
+const DEFAULT_MEMORY_BYTES = DEFAULT_MEMORY_ROWS * 8;
+
+const REGISTER_DISPLAY_NAMES: Record<string, string> = {
+  control: 'ctrl',
+  primask: 'pmask',
+  faultmask: 'fmask',
+  basepri: 'bpri',
+};
 
 const LED_PALETTE = [
   { name: 'Red', color: '#ff4d4f' },
@@ -102,7 +109,11 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
   private postState() {
     void this.view?.webview.postMessage({
       type: 'state',
-      registers: this.registers.map((r) => ({ name: r.name, value: formatHexWord(r.value) })),
+      registers: this.registers.map((r) => ({
+        name: r.name,
+        label: REGISTER_DISPLAY_NAMES[r.name] || r.name,
+        value: formatHexWord(r.value),
+      })),
       error: this.error,
     });
     this.postLeds();
@@ -267,6 +278,7 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
       }
       root.innerHTML = '';
       for (const reg of current) {
+        const displayName = reg.label || reg.name;
         const row = document.createElement('div');
         row.className = 'row';
         const parsed = parseInt(reg.value, 16);
@@ -276,7 +288,7 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
 
         const nameEl = document.createElement('span');
         nameEl.className = 'name';
-        nameEl.textContent = reg.name;
+        nameEl.textContent = displayName;
         row.appendChild(nameEl);
 
         if (editingName === reg.name) {
@@ -358,13 +370,24 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
+interface MemoryWord {
+  address: string;
+  wordHex: string;
+}
+
+interface MemoryRow {
+  address: string;
+  words: MemoryWord[];
+  ascii: string;
+}
+
 /**
- * Webview view rendering 10 32-bit words from a chosen address (default 0x00000000) with inline editing.
+ * Webview view rendering 10 8-byte rows (two 4-byte words per row) with inline editing.
  */
 export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private address = DEFAULT_MEMORY_ADDRESS;
-  private rows: Array<{ address: string; wordHex: string; ascii: string }> = [];
+  private rows: MemoryRow[] = [];
   private error?: string;
 
   constructor(private readonly getHandler: () => ViewActionHandler | undefined) {}
@@ -523,10 +546,10 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       height: 22px;
-      padding: 0 10px;
-      gap: 8px;
+      padding: 0 8px;
+      gap: 6px;
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
+      font-size: 11.5px;
     }
     .row:hover {
       background: var(--vscode-list-hoverBackground);
@@ -540,23 +563,36 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
       content: ':';
       color: var(--vscode-foreground);
     }
+    .words {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+    }
     .val {
       color: var(--vscode-debugTokenExpression-number, #b5cea8);
       cursor: text;
-      padding: 1px 4px;
+      padding: 1px 3px;
       border-radius: 2px;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .val:hover {
       background: var(--vscode-editor-selectionBackground, rgba(128, 128, 128, 0.2));
     }
     .ascii {
       color: var(--vscode-descriptionForeground);
-      margin-left: auto;
       white-space: pre;
+      flex-shrink: 0;
+    }
+    @media (max-width: 330px) {
+      .ascii { display: none; }
     }
     .edit-input {
-      width: 108px;
+      width: 100%;
+      min-width: 0;
       height: 19px;
       padding: 0 4px;
       border: 1px solid var(--vscode-focusBorder, #007fd4);
@@ -564,14 +600,14 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
+      font-size: 11.5px;
       outline: none;
     }
   </style>
 </head>
 <body>
   <div class="bar">
-    <input id="addrInput" class="addr-input" type="text" value="${DEFAULT_MEMORY_ADDRESS}" placeholder="0x00000000" title="Start address (shows 10 words)" />
+    <input id="addrInput" class="addr-input" type="text" value="${DEFAULT_MEMORY_ADDRESS}" placeholder="0x00000000" title="Start address (shows 10 rows of 8 bytes)" />
     <button id="goBtn" class="go-btn">Read</button>
   </div>
   <div id="error" class="error"></div>
@@ -604,54 +640,60 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
       for (const rowData of currentRows) {
         const row = document.createElement('div');
         row.className = 'row';
-        row.title = rowData.address + ': ' + rowData.wordHex + ' — click value to edit';
 
         const addrEl = document.createElement('span');
         addrEl.className = 'addr';
         addrEl.textContent = rowData.address;
         row.appendChild(addrEl);
 
-        if (editingAddr === rowData.address) {
-          const input = document.createElement('input');
-          input.className = 'edit-input';
-          input.value = rowData.wordHex;
-          let finished = false;
-          const commit = () => {
-            if (finished) return;
-            finished = true;
-            const val = input.value.trim();
-            editingAddr = null;
-            if (val && val !== rowData.wordHex) {
-              vscode.postMessage({ type: 'writeMemory', address: rowData.address, value: val });
-            }
-            render();
-          };
-          input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-              commit();
-            } else if (e.key === 'Escape') {
+        const wordsEl = document.createElement('div');
+        wordsEl.className = 'words';
+
+        for (const word of rowData.words) {
+          if (editingAddr === word.address) {
+            const input = document.createElement('input');
+            input.className = 'edit-input';
+            input.value = word.wordHex;
+            let finished = false;
+            const commit = () => {
+              if (finished) return;
               finished = true;
+              const val = input.value.trim();
               editingAddr = null;
+              if (val && val !== word.wordHex) {
+                vscode.postMessage({ type: 'writeMemory', address: word.address, value: val });
+              }
               render();
-            }
-          });
-          input.addEventListener('blur', commit);
-          row.appendChild(input);
-          setTimeout(() => { input.focus(); input.select(); }, 0);
-        } else {
-          const valEl = document.createElement('span');
-          valEl.className = 'val';
-          valEl.textContent = rowData.wordHex;
-          valEl.addEventListener('click', () => {
-            editingAddr = rowData.address;
-            render();
-          });
-          row.appendChild(valEl);
-          row.addEventListener('dblclick', () => {
-            editingAddr = rowData.address;
-            render();
-          });
+            };
+            input.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter') {
+                commit();
+              } else if (e.key === 'Escape') {
+                finished = true;
+                editingAddr = null;
+                render();
+              }
+            });
+            input.addEventListener('blur', commit);
+            wordsEl.appendChild(input);
+            setTimeout(() => { input.focus(); input.select(); }, 0);
+          } else {
+            const valEl = document.createElement('span');
+            valEl.className = 'val';
+            valEl.textContent = word.wordHex;
+            valEl.title = word.address + ': ' + word.wordHex + ' — click to edit';
+            valEl.addEventListener('click', () => {
+              editingAddr = word.address;
+              render();
+            });
+            valEl.addEventListener('dblclick', () => {
+              editingAddr = word.address;
+              render();
+            });
+            wordsEl.appendChild(valEl);
+          }
         }
+        row.appendChild(wordsEl);
 
         const asciiEl = document.createElement('span');
         asciiEl.className = 'ascii';
@@ -664,20 +706,7 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (!msg) return;
-      if (msg.type === 'leds') {
-        ledStrip.classList.toggle('active', Boolean(msg.active));
-        const val = typeof msg.rawValue === 'number' ? (msg.rawValue >>> 0) : null;
-        for (const el of leds) {
-          const idx = Number(el.dataset.index);
-          const name = el.dataset.name;
-          const on = val !== null && ((val & (1 << idx)) !== 0);
-          el.classList.toggle('on', on);
-          el.title = 'LED ' + idx + ' (' + name + '): ' + (on ? 'ON' : 'OFF');
-        }
-        return;
-      }
-      if (msg.type !== 'state') return;
+      if (!msg || msg.type !== 'state') return;
       if (msg.address && document.activeElement !== addrInput) {
         addrInput.value = msg.address;
       }
@@ -754,17 +783,26 @@ function formatHexWord(value: string): string {
   return `0x${(num >>> 0).toString(16).padStart(8, '0')}`;
 }
 
-function formatMemoryRows(baseAddress: string, hexBytes: string): Array<{ address: string; wordHex: string; ascii: string }> {
+function formatMemoryRows(baseAddress: string, hexBytes: string): MemoryRow[] {
   const base = parseInt(baseAddress, 0) >>> 0;
-  const rows: Array<{ address: string; wordHex: string; ascii: string }> = [];
-  for (let offset = 0; offset + 8 <= hexBytes.length; offset += 8) {
-    const chunk = hexBytes.slice(offset, offset + 8);
-    const bytes = chunk.match(/.{2}/g)!.map((b) => parseInt(b, 16));
-    const word = ((bytes[3] << 24) | (bytes[2] << 16) | (bytes[1] << 8) | bytes[0]) >>> 0;
-    const ascii = bytes.map((b) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.')).join('');
+  const rows: MemoryRow[] = [];
+  for (let offset = 0; offset + 16 <= hexBytes.length; offset += 16) {
+    const rowBase = (base + offset / 2) >>> 0;
+    const words: MemoryWord[] = [];
+    let ascii = '';
+    for (let w = 0; w < 2; w++) {
+      const chunk = hexBytes.slice(offset + w * 8, offset + (w + 1) * 8);
+      const bytes = chunk.match(/.{2}/g)!.map((b) => parseInt(b, 16));
+      const word = ((bytes[3] << 24) | (bytes[2] << 16) | (bytes[1] << 8) | bytes[0]) >>> 0;
+      ascii += bytes.map((b) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.')).join('');
+      words.push({
+        address: `0x${((rowBase + w * 4) >>> 0).toString(16).padStart(8, '0')}`,
+        wordHex: `0x${word.toString(16).padStart(8, '0')}`,
+      });
+    }
     rows.push({
-      address: `0x${((base + offset / 2) >>> 0).toString(16).padStart(8, '0')}`,
-      wordHex: `0x${word.toString(16).padStart(8, '0')}`,
+      address: `0x${rowBase.toString(16).padStart(8, '0')}`,
+      words,
       ascii,
     });
   }
