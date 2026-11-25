@@ -47,6 +47,8 @@ const LED_PALETTE = [
 export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private registers: RegisterEntry[] = [];
+  private ledsRaw?: number;
+  private ledsActive = false;
   private error?: string;
 
   constructor(private readonly getHandler: () => ViewActionHandler | undefined) {}
@@ -86,6 +88,12 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
     this.postState();
   }
 
+  updateLeds(rawValue?: number, active = true) {
+    this.ledsRaw = rawValue;
+    this.ledsActive = active;
+    this.postLeds();
+  }
+
   setError(error: string) {
     this.error = error;
     this.postState();
@@ -97,10 +105,26 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
       registers: this.registers.map((r) => ({ name: r.name, value: formatHexWord(r.value) })),
       error: this.error,
     });
+    this.postLeds();
+  }
+
+  private postLeds() {
+    void this.view?.webview.postMessage({
+      type: 'leds',
+      active: this.ledsActive,
+      rawValue: this.ledsRaw,
+    });
   }
 
   private renderHtml(): string {
     const nonce = crypto.randomBytes(16).toString('hex');
+    const ledsHtml = LED_PALETTE.map((led, i) => {
+      const isOn = this.ledsRaw !== undefined && ((this.ledsRaw >>> 0) & (1 << i)) !== 0;
+      const cls = isOn ? 'led on' : 'led';
+      const title = `LED ${i} (${led.name}): ${isOn ? 'ON' : 'OFF'}`;
+      return `<span class="${cls}" data-index="${i}" data-name="${led.name}" style="--led:${led.color}" title="${title}"></span>`;
+    }).join('');
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -116,6 +140,38 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
       font-size: 13px;
       user-select: none;
     }
+    .led-strip {
+      display: none;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: nowrap;
+      gap: 6px;
+      height: 26px;
+      padding: 0 14px;
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.2));
+    }
+    .led-strip.active {
+      display: flex;
+    }
+    .led {
+      width: 13px;
+      height: 13px;
+      min-width: 10px;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--led) 15%, transparent);
+      border: 1.5px solid color-mix(in srgb, var(--led) 45%, transparent);
+      transition: background 100ms ease, border-color 100ms ease;
+    }
+    .led.on {
+      background: var(--led);
+      border-color: var(--led);
+      box-shadow: none;
+    }
     .error {
       display: none;
       margin: 4px 8px;
@@ -128,22 +184,28 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
     }
     .error.visible { display: block; }
     .empty {
-      padding: 8px 14px;
+      grid-column: 1 / -1;
+      padding: 8px 8px;
       color: var(--vscode-descriptionForeground);
       font-size: 12px;
     }
     .list {
-      padding: 2px 0;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: 6px;
+      padding: 2px 6px;
     }
     .row {
       display: flex;
       align-items: center;
       height: 22px;
-      padding: 0 12px 0 16px;
-      gap: 6px;
+      padding: 0 6px;
+      gap: 4px;
+      min-width: 0;
+      border-radius: 2px;
       cursor: default;
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
+      font-size: 11.5px;
     }
     .row:hover {
       background: var(--vscode-list-hoverBackground);
@@ -160,10 +222,11 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
     .value {
       color: var(--vscode-debugTokenExpression-number, #b5cea8);
       cursor: text;
+      min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      padding: 1px 4px;
+      padding: 1px 3px;
       border-radius: 2px;
     }
     .value:hover {
@@ -172,7 +235,6 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
     .edit-input {
       flex: 1;
       min-width: 0;
-      max-width: 120px;
       height: 19px;
       padding: 0 4px;
       border: 1px solid var(--vscode-focusBorder, #007fd4);
@@ -180,16 +242,19 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
+      font-size: 11.5px;
       outline: none;
     }
   </style>
 </head>
 <body>
+  <div id="ledStrip" class="led-strip${this.ledsActive ? ' active' : ''}">${ledsHtml}</div>
   <div id="error" class="error"></div>
   <div id="root" class="list"></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const ledStrip = document.getElementById('ledStrip');
+    const leds = Array.from(ledStrip.querySelectorAll('.led'));
     const root = document.getElementById('root');
     const errEl = document.getElementById('error');
     let current = [];
@@ -261,7 +326,20 @@ export class QemuRegistersViewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (!msg || msg.type !== 'state') return;
+      if (!msg) return;
+      if (msg.type === 'leds') {
+        ledStrip.classList.toggle('active', Boolean(msg.active));
+        const val = typeof msg.rawValue === 'number' ? (msg.rawValue >>> 0) : null;
+        for (const el of leds) {
+          const idx = Number(el.dataset.index);
+          const name = el.dataset.name;
+          const on = val !== null && ((val & (1 << idx)) !== 0);
+          el.classList.toggle('on', on);
+          el.title = 'LED ' + idx + ' (' + name + '): ' + (on ? 'ON' : 'OFF');
+        }
+        return;
+      }
+      if (msg.type !== 'state') return;
       if (msg.error) {
         errEl.textContent = msg.error;
         errEl.classList.add('visible');
@@ -586,7 +664,20 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (!msg || msg.type !== 'state') return;
+      if (!msg) return;
+      if (msg.type === 'leds') {
+        ledStrip.classList.toggle('active', Boolean(msg.active));
+        const val = typeof msg.rawValue === 'number' ? (msg.rawValue >>> 0) : null;
+        for (const el of leds) {
+          const idx = Number(el.dataset.index);
+          const name = el.dataset.name;
+          const on = val !== null && ((val & (1 << idx)) !== 0);
+          el.classList.toggle('on', on);
+          el.title = 'LED ' + idx + ' (' + name + '): ' + (on ? 'ON' : 'OFF');
+        }
+        return;
+      }
+      if (msg.type !== 'state') return;
       if (msg.address && document.activeElement !== addrInput) {
         addrInput.value = msg.address;
       }
@@ -609,117 +700,13 @@ export class QemuMemoryViewProvider implements vscode.WebviewViewProvider {
 }
 
 /**
- * Webview view rendering 8 differently colored solid LEDs in a single horizontal row.
- */
-export class QemuLedsViewProvider implements vscode.WebviewViewProvider {
-  private view?: vscode.WebviewView;
-  private rawValue?: number;
-
-  resolveWebviewView(webviewView: vscode.WebviewView) {
-    this.view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = this.renderHtml();
-    webviewView.webview.onDidReceiveMessage((msg) => {
-      if (msg?.type === 'ready') this.postState();
-    });
-    webviewView.onDidDispose(() => {
-      if (this.view === webviewView) this.view = undefined;
-    });
-    this.postState();
-  }
-
-  update(rawValue?: number) {
-    this.rawValue = rawValue;
-    this.postState();
-  }
-
-  private postState() {
-    void this.view?.webview.postMessage({ type: 'leds', rawValue: this.rawValue });
-  }
-
-  private renderHtml(): string {
-    const nonce = crypto.randomBytes(16).toString('hex');
-    const ledsHtml = LED_PALETTE.map((led, i) => {
-      const isOn = this.rawValue !== undefined && ((this.rawValue >>> 0) & (1 << i)) !== 0;
-      const cls = isOn ? 'led on' : 'led';
-      const title = `LED ${i} (${led.name}): ${isOn ? 'ON' : 'OFF'}`;
-      return `<span class="${cls}" data-index="${i}" data-name="${led.name}" style="--led:${led.color}" title="${title}"></span>`;
-    }).join('');
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-  <style>
-    html, body {
-      margin: 0;
-      padding: 0;
-      background: transparent;
-      overflow: hidden;
-    }
-    .strip {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: nowrap;
-      gap: 6px;
-      height: 26px;
-      padding: 0 12px;
-      box-sizing: border-box;
-      width: 100%;
-    }
-    .led {
-      width: 14px;
-      height: 14px;
-      min-width: 10px;
-      aspect-ratio: 1;
-      border-radius: 50%;
-      box-sizing: border-box;
-      background: color-mix(in srgb, var(--led) 15%, transparent);
-      border: 1.5px solid color-mix(in srgb, var(--led) 45%, transparent);
-      transition: background 100ms ease, border-color 100ms ease;
-    }
-    .led.on {
-      background: var(--led);
-      border-color: var(--led);
-      box-shadow: none;
-    }
-  </style>
-</head>
-<body>
-  <div class="strip">${ledsHtml}</div>
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const leds = Array.from(document.querySelectorAll('.led'));
-    window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (!msg || msg.type !== 'leds') return;
-      const val = typeof msg.rawValue === 'number' ? (msg.rawValue >>> 0) : null;
-      for (const el of leds) {
-        const idx = Number(el.dataset.index);
-        const name = el.dataset.name;
-        const on = val !== null && ((val & (1 << idx)) !== 0);
-        el.classList.toggle('on', on);
-        el.title = 'LED ' + idx + ' (' + name + '): ' + (on ? 'ON' : 'OFF');
-      }
-    });
-    vscode.postMessage({ type: 'ready' });
-  </script>
-</body>
-</html>`;
-  }
-}
-
-/**
- * Coordinates the separate Registers, Memory, and LEDs views.
+ * Coordinates the Registers (with pinned LED strip) and Memory sidebar views.
  */
 export class QemuDebugViews implements DebugViewSink, vscode.Disposable {
   private actionHandler?: ViewActionHandler;
 
   readonly registersProvider = new QemuRegistersViewProvider(() => this.actionHandler);
   readonly memoryProvider = new QemuMemoryViewProvider(() => this.actionHandler);
-  readonly ledsProvider = new QemuLedsViewProvider();
 
   setActionHandler(handler?: ViewActionHandler) {
     this.actionHandler = handler;
@@ -730,7 +717,7 @@ export class QemuDebugViews implements DebugViewSink, vscode.Disposable {
   }
 
   setLeds(leds: LedState) {
-    this.ledsProvider.update(leds.rawValue);
+    this.registersProvider.updateLeds(leds.rawValue, true);
   }
 
   setMemoryHex(address: string, hexBytes: string) {
@@ -747,8 +734,8 @@ export class QemuDebugViews implements DebugViewSink, vscode.Disposable {
 
   clearSession() {
     this.registersProvider.update([]);
+    this.registersProvider.updateLeds(undefined, false);
     this.memoryProvider.clear();
-    this.ledsProvider.update(undefined);
   }
 
   dispose() {}

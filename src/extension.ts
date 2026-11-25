@@ -219,9 +219,6 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewViewProvider('qemu-m3.memoryView', views.memoryProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    vscode.window.registerWebviewViewProvider('qemu-m3.ledsView', views.ledsProvider, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
 
     vscode.debug.registerDebugAdapterDescriptorFactory('qemu-m3', {
       createDebugAdapterDescriptor: () => {

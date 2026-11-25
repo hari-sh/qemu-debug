@@ -12,9 +12,8 @@
   ],
   "activationEvents": [
     "onDebug",
-    "onView:qemu-m3.registersView",
     "onView:qemu-m3.memoryView",
-    "onView:qemu-m3.ledsView"
+    "onView:qemu-m3.registersView"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -139,11 +138,6 @@
           "id": "qemu-m3.memoryView",
           "name": "Memory",
           "type": "webview"
-        },
-        {
-          "id": "qemu-m3.ledsView",
-          "name": "LEDs",
-          "type": "webview"
         }
       ]
     },
@@ -151,7 +145,7 @@
       "view/title": [
         {
           "command": "qemu-m3.refreshViews",
-          "when": "view == qemu-m3.registersView || view == qemu-m3.memoryView || view == qemu-m3.ledsView",
+          "when": "view == qemu-m3.memoryView || view == qemu-m3.registersView",
           "group": "navigation"
         }
       ]
