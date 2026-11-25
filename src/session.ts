@@ -25,6 +25,13 @@ interface DAPRequest {
   arguments?: any;
 }
 
+export interface SourceAssemblyLine {
+  file: string;
+  line: number;
+  instructions: Array<{ address: string; instruction: string }>;
+  pc: string;
+}
+
 const LOCALS_SCOPE_REF = 1;
 
 /**
@@ -56,7 +63,9 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   constructor(
     private readonly views?: DebugViewSink,
-    private readonly onDispose?: () => void
+    private readonly onDispose?: () => void,
+    private readonly onStopped?: () => void,
+    private readonly onResumed?: () => void
   ) {}
 
   handleMessage(message: vscode.DebugProtocolMessage) {
@@ -131,6 +140,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
         case 'continue':
           await this.mi('exec-continue');
           this.status = 'Running';
+          this.onResumed?.();
           this.reply(m, { allThreadsContinued: true });
           break;
         case 'pause':
@@ -141,6 +151,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-next-instruction' : 'exec-next';
           await this.mi(cmd);
           this.status = 'Running';
+          this.onResumed?.();
           this.reply(m);
           break;
         }
@@ -148,12 +159,14 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-step-instruction' : 'exec-step';
           await this.mi(cmd);
           this.status = 'Running';
+          this.onResumed?.();
           this.reply(m);
           break;
         }
         case 'stepOut':
           await this.mi('exec-finish');
           this.status = 'Running';
+          this.onResumed?.();
           this.reply(m);
           break;
         case 'setBreakpoints':
@@ -728,9 +741,51 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.reply(m, { instructions: insns });
   }
 
+  async getMixedSourceAssembly(): Promise<SourceAssemblyLine[]> {
+    if (this.status !== 'Stopped' || this.terminated) return [];
+    const pcRec = await this.mi('data-evaluate-expression "(unsigned int)$pc"');
+    const pcNumber = Number(this.asString(pcRec.results.value));
+    if (!Number.isFinite(pcNumber)) return [];
+    const pc = `0x${(pcNumber >>> 0).toString(16).padStart(8, '0')}`;
+
+    let rec: MIRecord;
+    try {
+      const frameRec = await this.mi('stack-list-frames 0 0');
+      const rawFrame = this.asObject(this.asArray(frameRec.results.stack)[0]);
+      const frame = rawFrame?.frame ? this.asObject(rawFrame.frame) : rawFrame;
+      const fullname = this.asString(frame?.fullname);
+      if (fullname) {
+        rec = await this.mi(`data-disassemble -f "${this.escapeMI(fullname)}" -l 1 -- 1`);
+      } else {
+        const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
+        rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
+      }
+    } catch {
+      const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
+      rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
+    }
+
+    const lines: SourceAssemblyLine[] = [];
+    for (const entry of this.asArray(rec.results.asm_insns)) {
+      const group = this.asObject(entry);
+      const source = this.asObject(group?.src_and_asm_line);
+      const rawFile = this.asString(source?.fullname) || this.asString(source?.file);
+      const line = Number(this.asString(source?.line));
+      if (!rawFile || !Number.isFinite(line) || line < 1) continue;
+      const file = path.resolve(this.root, rawFile);
+      const instructions = this.asArray(source?.line_asm_insn).map((item) => {
+        const asm = this.asObject(item);
+        return { address: this.asString(asm?.address), instruction: this.asString(asm?.inst).replace(/\t+/g, ' ') };
+      }).filter((instruction) => instruction.instruction.length > 0);
+      if (instructions.length) lines.push({ file, line, instructions, pc });
+    }
+    return lines;
+  }
+
   private stop(reason: string) {
     this.status = 'Stopped';
     void this.refreshPeripheralViews();
+    this.onStopped?.();
     this.sendEvent('stopped', { reason, threadId: 1, allThreadsStopped: true });
   }
 
@@ -745,6 +800,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.qemu = undefined;
     this.status = 'Disconnected';
     this.views?.clearSession();
+    this.onResumed?.();
     this.sendEvent('terminated');
   }
 
