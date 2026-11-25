@@ -11,7 +11,10 @@
     "Debuggers"
   ],
   "activationEvents": [
-    "onDebug"
+    "onDebug",
+    "onView:qemu-m3.registersView",
+    "onView:qemu-m3.memoryView",
+    "onView:qemu-m3.ledsView"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -117,12 +120,47 @@
           }
         ]
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "qemu-m3.refreshViews",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "id": "qemu-m3.registersView",
+          "name": "Registers",
+          "type": "webview"
+        },
+        {
+          "id": "qemu-m3.memoryView",
+          "name": "Memory",
+          "type": "webview"
+        },
+        {
+          "id": "qemu-m3.ledsView",
+          "name": "LEDs",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "qemu-m3.refreshViews",
+          "when": "view == qemu-m3.registersView || view == qemu-m3.memoryView || view == qemu-m3.ledsView",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "test": "npm run compile"
+    "test": "npx tsc --noEmit && npm run compile"
   },
   "dependencies": {
     "tree-kill": "^1.2.2"

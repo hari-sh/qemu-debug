@@ -5,6 +5,7 @@ import * as net from 'net';
 import * as path from 'path';
 import treeKill = require('tree-kill');
 import { MIObject, MIParser, MIRecord, MIValue } from './mi';
+import { DebugViewSink, RegisterEntry } from './tree';
 
 type Config = vscode.DebugConfiguration & {
   elfFile?: string;
@@ -24,9 +25,7 @@ interface DAPRequest {
   arguments?: any;
 }
 
-const REG_SCOPE_REF = 1;
-const LOCALS_SCOPE_REF = 2;
-const LEDS_SCOPE_REF = 3;
+const LOCALS_SCOPE_REF = 1;
 
 /**
  * Debug Adapter for QEMU Cortex-M3 targets driven over GDB/MI2.
@@ -52,6 +51,11 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   private terminated = false;
   private disposed = false;
 
+  constructor(
+    private readonly views?: DebugViewSink,
+    private readonly onDispose?: () => void
+  ) {}
+
   handleMessage(message: vscode.DebugProtocolMessage) {
     const req = message as DAPRequest;
     if (req.type === 'request') void this.request(req);
@@ -60,6 +64,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   dispose() {
     this.disposed = true;
     this.end();
+    this.onDispose?.();
     this.emitter.dispose();
   }
 
@@ -159,8 +164,6 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           this.reply(m, {
             scopes: [
               { name: 'Locals', variablesReference: LOCALS_SCOPE_REF, expensive: false },
-              { name: 'Registers', variablesReference: REG_SCOPE_REF, expensive: false },
-              { name: 'LEDs', variablesReference: LEDS_SCOPE_REF, expensive: false },
             ],
           });
           break;
@@ -200,6 +203,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.cfg.machine ||= 'mps2-an385';
 
     const env = this.buildEnv();
+    this.views?.setLeds({ address: this.cfg.ledRegister || '0x40028000' });
 
     if (!attach && this.cfg.buildCommand) {
       this.status = 'Building';
@@ -537,31 +541,8 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   }
 
   private async handleVariables(m: DAPRequest) {
-    const ref: number = m.arguments?.variablesReference;
-    if (ref === REG_SCOPE_REF) {
-      if (this.registerNames.length === 0) {
-        const namesRec = await this.mi('data-list-register-names');
-        this.registerNames = this.asArray(namesRec.results['register-names']).map((v) => this.asString(v));
-      }
-      const valsRec = await this.mi('data-list-register-values x');
-      const vals = this.asArray(valsRec.results['register-values']);
-      const variables = vals
-        .map((item) => {
-          const obj = this.asObject(item);
-          const num = Number(this.asString(obj?.number));
-          const name = this.registerNames[num] || '';
-          const value = this.asString(obj?.value);
-          return { name, value, variablesReference: 0 };
-        })
-        .filter((v) => v.name.length > 0);
-      this.reply(m, { variables });
-      return;
-    }
-
-    if (ref === LEDS_SCOPE_REF) {
-      const addr = this.cfg.ledRegister || '0x40028000';
-      const variables = await this.readLedVariables(addr);
-      this.reply(m, { variables });
+    if (m.arguments?.variablesReference !== LOCALS_SCOPE_REF) {
+      this.reply(m, { variables: [] });
       return;
     }
 
@@ -578,27 +559,113 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.reply(m, { variables: vars });
   }
 
-  private async readLedVariables(addr: string) {
+  /**
+   * Refreshes the dedicated Target, Registers, LEDs, and Memory sidebar views when stopped.
+   */
+  async refreshPeripheralViews(): Promise<void> {
+    if (!this.views || this.status !== 'Stopped' || this.terminated) return;
+
     try {
-      const rec = await this.mi(`data-read-memory-bytes ${addr} 4`);
-      const mem = this.asObject(this.asArray(rec.results.memory)[0]);
-      const hex = this.asString(mem?.contents);
-      if (hex.length >= 8) {
-        const bytes = hex.match(/.{2}/g)!.map((b) => parseInt(b, 16));
-        const val = ((bytes[3] << 24) | (bytes[2] << 16) | (bytes[1] << 8) | bytes[0]) >>> 0;
-        return [
-          { name: `Register (${addr})`, value: `0x${val.toString(16).padStart(8, '0')}`, variablesReference: 0 },
-          ...[...Array(8)].map((_, i) => ({
-            name: `LED${i}`,
-            value: (val & (1 << i)) !== 0 ? 'ON' : 'OFF',
-            variablesReference: 0,
-          })),
-        ];
+      const regs = await this.readRegisters();
+      if (this.status === 'Stopped') this.views.setRegisters(regs);
+    } catch {
+      // Ignore transient read errors while stepping/resuming
+    }
+
+    try {
+      const addr = this.cfg.ledRegister || '0x40028000';
+      const hex = await this.readMemoryHex(addr, 4);
+      if (this.status === 'Stopped' && hex.length >= 8) {
+        this.views.setLeds({ address: addr, rawValue: this.parseLittleEndianWord(hex) });
       }
     } catch {
-      // Fall through to unknown state
+      // Ignore if target cannot read LED register
     }
-    return [...Array(8)].map((_, i) => ({ name: `LED${i}`, value: 'unknown', variablesReference: 0 }));
+
+    await this.refreshMemoryView();
+  }
+
+  async refreshMemoryView(): Promise<void> {
+    if (!this.views || this.status !== 'Stopped' || this.terminated) return;
+    const req = this.views.getMemoryRequest();
+    try {
+      const hex = await this.readMemoryHex(req.address, req.byteCount);
+      if (this.status === 'Stopped') {
+        this.views.setMemoryHex(req.address, hex);
+      }
+    } catch (err) {
+      if (this.status === 'Stopped') {
+        this.views.setMemoryError(req.address, err instanceof Error ? err.message : String(err));
+      }
+    }
+  }
+
+  async readMemoryToView(address: string): Promise<void> {
+    if (this.status !== 'Stopped') {
+      throw new Error('Target must be stopped before reading memory.');
+    }
+    const req = this.views?.getMemoryRequest();
+    const hex = await this.readMemoryHex(address, req?.byteCount ?? 40);
+    this.views?.setMemoryHex(address, hex);
+  }
+
+  async writeRegister(name: string, rawValue: string): Promise<void> {
+    if (this.status !== 'Stopped') {
+      throw new Error('Target must be stopped before editing registers.');
+    }
+    const cleanName = name.trim();
+    if (!/^[a-zA-Z0-9_]+$/.test(cleanName)) {
+      throw new Error(`Invalid register name: ${name}`);
+    }
+    const num = Number(rawValue.trim());
+    if (!Number.isFinite(num)) {
+      throw new Error(`Invalid value: ${rawValue}`);
+    }
+    const valHex = `0x${(num >>> 0).toString(16)}`;
+    await this.mi(`interpreter-exec console "set $${cleanName} = ${valHex}"`);
+    await this.refreshPeripheralViews();
+  }
+
+  async writeMemoryWord(address: string, value: number): Promise<void> {
+    if (this.status !== 'Stopped') {
+      throw new Error('Target must be stopped before writing memory.');
+    }
+    const addrNum = Number(address);
+    if (!Number.isFinite(addrNum)) {
+      throw new Error(`Invalid address: ${address}`);
+    }
+    const addrHex = `0x${(addrNum >>> 0).toString(16)}`;
+    const valHex = `0x${(value >>> 0).toString(16)}`;
+    await this.mi(`interpreter-exec console "set {unsigned int}${addrHex} = ${valHex}"`);
+    await this.refreshPeripheralViews();
+  }
+
+  private async readRegisters(): Promise<RegisterEntry[]> {
+    if (this.registerNames.length === 0) {
+      const namesRec = await this.mi('data-list-register-names');
+      this.registerNames = this.asArray(namesRec.results['register-names']).map((v) => this.asString(v));
+    }
+    const valsRec = await this.mi('data-list-register-values x');
+    return this.asArray(valsRec.results['register-values'])
+      .map((item) => {
+        const obj = this.asObject(item);
+        const num = Number(this.asString(obj?.number));
+        const name = this.registerNames[num] || '';
+        const value = this.asString(obj?.value);
+        return { name, value };
+      })
+      .filter((r) => r.name.length > 0);
+  }
+
+  private async readMemoryHex(addr: string, byteCount: number): Promise<string> {
+    const rec = await this.mi(`data-read-memory-bytes ${addr} ${byteCount}`);
+    const mem = this.asObject(this.asArray(rec.results.memory)[0]);
+    return this.asString(mem?.contents);
+  }
+
+  private parseLittleEndianWord(hex: string): number {
+    const bytes = hex.slice(0, 8).match(/.{2}/g)!.map((b) => parseInt(b, 16));
+    return ((bytes[3] << 24) | (bytes[2] << 16) | (bytes[1] << 8) | bytes[0]) >>> 0;
   }
 
   private async handleEvaluate(m: DAPRequest) {
@@ -651,6 +718,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private stop(reason: string) {
     this.status = 'Stopped';
+    void this.refreshPeripheralViews();
     this.sendEvent('stopped', { reason, threadId: 1, allThreadsStopped: true });
   }
 
@@ -663,6 +731,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.gdb = undefined;
     this.qemu = undefined;
     this.status = 'Disconnected';
+    this.views?.clearSession();
     this.sendEvent('terminated');
   }
 
