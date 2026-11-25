@@ -36,6 +36,9 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private gdb?: cp.ChildProcessWithoutNullStreams;
   private qemu?: cp.ChildProcess;
+  private qmpSocket?: net.Socket;
+  private qmpTimer?: NodeJS.Timeout;
+  private lastLedValue?: number;
   private parser = new MIParser();
   private seq = 1;
   private token = 1;
@@ -217,6 +220,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     }
 
     if (!attach) {
+      const qmpPort = await this.findFreePort().catch(() => undefined);
       const qemuArgs = [
         '-M', this.cfg.machine,
         '-cpu', 'cortex-m3',
@@ -226,10 +230,16 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
         '-S',
         '-gdb', `tcp:127.0.0.1:${this.cfg.gdbPort}`,
       ];
+      if (qmpPort) {
+        qemuArgs.push('-qmp', `tcp:127.0.0.1:${qmpPort},server,nowait`);
+      }
       if (this.cfg.elfFile) {
         qemuArgs.push('-kernel', this.cfg.elfFile);
       }
       await this.spawnQemu(this.cfg.qemuPath, qemuArgs, env);
+      if (qmpPort) {
+        this.startQmpLedMonitor(qmpPort);
+      }
     } else {
       this.status = 'Attaching';
     }
@@ -576,7 +586,9 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
       const addr = this.cfg.ledRegister || '0x40028000';
       const hex = await this.readMemoryHex(addr, 4);
       if (this.status === 'Stopped' && hex.length >= 8) {
-        this.views.setLeds({ address: addr, rawValue: this.parseLittleEndianWord(hex) });
+        const val = this.parseLittleEndianWord(hex);
+        this.lastLedValue = val;
+        this.views.setLeds({ address: addr, rawValue: val });
       }
     } catch {
       // Ignore if target cannot read LED register
@@ -725,6 +737,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   private end() {
     if (this.terminated) return;
     this.terminated = true;
+    this.stopQmpLedMonitor();
     this.rejectAllPending(new Error('Debug session terminated'));
     if (this.gdb?.pid) treeKill(this.gdb.pid, 'SIGTERM', () => undefined);
     if (this.qemu?.pid) treeKill(this.qemu.pid, 'SIGTERM', () => undefined);
@@ -733,6 +746,96 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.status = 'Disconnected';
     this.views?.clearSession();
     this.sendEvent('terminated');
+  }
+
+  private findFreePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        const port = addr && typeof addr === 'object' ? addr.port : 0;
+        srv.close(() => (port ? resolve(port) : reject(new Error('No free port'))));
+      });
+    });
+  }
+
+  private startQmpLedMonitor(port: number) {
+    if (!this.views || this.terminated) return;
+    const rawAddr = this.cfg.ledRegister || '0x40028000';
+    const addrNum = Number(rawAddr);
+    if (!Number.isFinite(addrNum)) return;
+    const addrHex = `0x${(addrNum >>> 0).toString(16)}`;
+
+    const sock = net.createConnection({ host: '127.0.0.1', port });
+    this.qmpSocket = sock;
+    let buf = '';
+    let capSent = false;
+    let ready = false;
+    let inFlight = false;
+    let qmpId = 2;
+
+    sock.on('data', (chunk) => {
+      buf += chunk.toString();
+      for (;;) {
+        const nl = buf.indexOf('\n');
+        if (nl < 0) break;
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let msg: any;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.QMP && !capSent) {
+          capSent = true;
+          sock.write(JSON.stringify({ execute: 'qmp_capabilities', id: 1 }) + '\n');
+        } else if (msg.id === 1 && !ready) {
+          ready = true;
+          this.qmpTimer = setInterval(() => {
+            if (this.terminated || sock.destroyed || inFlight) return;
+            inFlight = true;
+            sock.write(
+              JSON.stringify({
+                execute: 'human-monitor-command',
+                arguments: { 'command-line': `xp /1wx ${addrHex}` },
+                id: qmpId++,
+              }) + '\n'
+            );
+          }, 60);
+        } else if (typeof msg.id === 'number' && msg.id >= 2) {
+          inFlight = false;
+          if (typeof msg.return === 'string') {
+            const match = msg.return.match(/:\s*0x([0-9a-fA-F]+)/);
+            if (match) {
+              const val = parseInt(match[1], 16) >>> 0;
+              if (val !== this.lastLedValue) {
+                this.lastLedValue = val;
+                this.views?.setLeds({ address: rawAddr, rawValue: val });
+              }
+            }
+          }
+        }
+      }
+    });
+
+    sock.on('error', () => this.stopQmpLedMonitor());
+    sock.on('close', () => this.stopQmpLedMonitor());
+  }
+
+  private stopQmpLedMonitor() {
+    if (this.qmpTimer) {
+      clearInterval(this.qmpTimer);
+      this.qmpTimer = undefined;
+    }
+    if (this.qmpSocket) {
+      this.qmpSocket.destroy();
+      this.qmpSocket = undefined;
+    }
+    this.lastLedValue = undefined;
   }
 
   private escapeMI(s: string): string {
