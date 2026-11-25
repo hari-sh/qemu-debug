@@ -3,7 +3,12 @@
   "displayName": "qemu-debug",
   "description": "QEMU Cortex-M3 debugging for mps2-an385",
   "version": "0.1.0",
-  "publisher": "qemu-debug",
+  "publisher": "harikalyan",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hari-sh/qemu-debug.git"
+  },
   "engines": {
     "vscode": ">=1.85.0"
   },
@@ -152,9 +157,11 @@
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm test",
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "test": "npx tsc --noEmit && npm run compile"
+    "test": "npx tsc --noEmit && npm run compile",
+    "package": "vsce package --no-dependencies"
   },
   "dependencies": {
     "tree-kill": "^1.2.2"
