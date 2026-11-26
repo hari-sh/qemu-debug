@@ -27,7 +27,10 @@ class SourceAssemblyDecorations
 
   async refresh(adapter: QemuDebugAdapter) {
     try {
-      this.groups = await adapter.getMixedSourceAssembly();
+      const visibleSourceFiles = vscode.window.visibleTextEditors
+        .filter((e) => e.document.uri.scheme === 'file')
+        .map((e) => e.document.uri.fsPath);
+      this.groups = await adapter.getMixedSourceAssembly(visibleSourceFiles);
       this.lensesChanged.fire();
       for (const file of this.expanded.keys()) {
         const asmUri = this.asmUriFor(file);

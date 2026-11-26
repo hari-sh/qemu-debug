@@ -57,6 +57,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   private stopWaiters: Array<() => void> = [];
   private breakpointsByFile = new Map<string, number[]>();
   private registerNames: string[] = [];
+  private fileAssemblyCache = new Map<string, Array<Omit<SourceAssemblyLine, 'pc'>>>();
   private activeFrameId = 0;
   private terminated = false;
   private disposed = false;
@@ -209,17 +210,49 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private async start(attach: boolean) {
     this.terminated = false;
+    this.fileAssemblyCache.clear();
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
-    const resolve = (s?: string) => s?.replace(/\$\{workspaceFolder\}/g, this.root);
+    const baseEnv = this.buildEnv();
+    let makeVars: Record<string, string> | undefined;
 
-    this.cfg.elfFile = resolve(this.cfg.elfFile);
-    this.cfg.qemuPath = resolve(this.cfg.qemuPath) || this.findBinary('qemu-system-arm');
-    this.cfg.gdbPath = resolve(this.cfg.gdbPath) || this.findBinary('arm-none-eabi-gdb');
-    this.cfg.gdbPort ||= 3333;
-    this.cfg.machine ||= 'mps2-an385';
+    const resolveWorkspace = (s?: string) => s?.replace(/\$\{workspaceFolder\}/g, this.root);
+    const resolve = (s?: string) => {
+      if (s === undefined) return undefined;
+      let out = resolveWorkspace(s)!;
+      if (/\$\{make:[A-Za-z_][A-Za-z0-9_]*\}/.test(out)) {
+        if (!makeVars) {
+          const buildCmd = resolveWorkspace(this.cfg.buildCommand);
+          const dirMatch = buildCmd?.match(/(?:^|\s)-C\s+(?:"([^"]+)"|'([^']+)'|(\S+))/);
+          const makeDir = dirMatch ? path.resolve(this.root, dirMatch[1] || dirMatch[2] || dirMatch[3]) : this.root;
+          makeVars = this.loadMakefileVars(makeDir, baseEnv);
+        }
+        out = out.replace(/\$\{make:([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => {
+          const val = makeVars![name];
+          if (val === undefined || val === '') {
+            throw new Error(`Makefile variable '${name}' is not defined (referenced as \${make:${name}}).`);
+          }
+          return val;
+        });
+      }
+      return out;
+    };
+
+    const resolveBin = (raw: string | undefined, fallbackName: string) => {
+      const val = resolve(raw);
+      if (!val) return this.findBinary(fallbackName);
+      return val.includes('/') || val.includes('\\') ? val : this.findBinary(val);
+    };
+
+    const resolvedElf = resolve(this.cfg.elfFile);
+    this.cfg.elfFile = resolvedElf ? path.resolve(this.root, resolvedElf) : undefined;
+    this.cfg.qemuPath = resolveBin(this.cfg.qemuPath, 'qemu-system-arm');
+    this.cfg.gdbPath = resolveBin(this.cfg.gdbPath, 'arm-none-eabi-gdb');
+    this.cfg.gdbPort = Number(resolve(this.cfg.gdbPort !== undefined ? String(this.cfg.gdbPort) : undefined)) || 3333;
+    this.cfg.machine = resolve(this.cfg.machine) || 'mps2-an385';
+    this.cfg.ledRegister = resolve(this.cfg.ledRegister) || '0x40028000';
 
     const env = this.buildEnv();
-    this.views?.setLeds({ address: this.cfg.ledRegister || '0x40028000' });
+    this.views?.setLeds({ address: this.cfg.ledRegister });
 
     if (!attach && this.cfg.buildCommand) {
       this.status = 'Building';
@@ -287,6 +320,48 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
       if (fs.existsSync(candidate)) return candidate;
     }
     return name;
+  }
+
+  private loadMakefileVars(makeDir: string, env: NodeJS.ProcessEnv): Record<string, string> {
+    let stdout = '';
+    try {
+      stdout = cp.execFileSync('make', ['-C', makeDir, '-pn'], {
+        cwd: makeDir,
+        env,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err: unknown) {
+      const execErr = err as { stdout?: string; message?: string };
+      if (typeof execErr?.stdout === 'string' && execErr.stdout.length > 0) {
+        stdout = execErr.stdout;
+      } else {
+        throw new Error(`Failed to read Makefile in ${makeDir}: ${execErr?.message || String(err)}`);
+      }
+    }
+
+    const raw: Record<string, string> = {};
+    for (const line of stdout.split(/\r?\n/)) {
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*[:+?]?=\s*(.*)$/);
+      if (m) {
+        raw[m[1]] = m[2].trim();
+      }
+    }
+
+    const expand = (value: string, seen = new Set<string>()): string =>
+      value.replace(/\$[({]([A-Za-z_][A-Za-z0-9_]*)[)}]/g, (_, name: string) => {
+        if (seen.has(name) || !(name in raw)) return '';
+        seen.add(name);
+        const expanded = expand(raw[name], seen);
+        seen.delete(name);
+        return expanded;
+      });
+
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      out[k] = expand(v);
+    }
+    return out;
   }
 
   private runBuild(command: string, env: NodeJS.ProcessEnv): Promise<void> {
@@ -748,31 +823,98 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.reply(m, { instructions: insns });
   }
 
-  async getMixedSourceAssembly(): Promise<SourceAssemblyLine[]> {
+  async getMixedSourceAssembly(candidateFiles: string[] = []): Promise<SourceAssemblyLine[]> {
     if (this.status !== 'Stopped' || this.terminated) return [];
     const pcRec = await this.mi('data-evaluate-expression "(unsigned int)$pc"');
     const pcNumber = Number(this.asString(pcRec.results.value));
     if (!Number.isFinite(pcNumber)) return [];
     const pc = `0x${(pcNumber >>> 0).toString(16).padStart(8, '0')}`;
 
-    let rec: MIRecord;
+    const targetFiles = new Set<string>();
     try {
-      const frameRec = await this.mi('stack-list-frames 0 0');
-      const rawFrame = this.asObject(this.asArray(frameRec.results.stack)[0]);
-      const frame = rawFrame?.frame ? this.asObject(rawFrame.frame) : rawFrame;
-      const fullname = this.asString(frame?.fullname);
-      if (fullname) {
-        rec = await this.mi(`data-disassemble -f "${this.escapeMI(fullname)}" -l 1 -- 1`);
-      } else {
-        const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
-        rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
+      const frameRec = await this.mi('stack-list-frames');
+      for (const entry of this.asArray(frameRec.results.stack)) {
+        const rawFrame = this.asObject(entry);
+        const frame = rawFrame?.frame ? this.asObject(rawFrame.frame) : rawFrame;
+        const fullname = this.asString(frame?.fullname);
+        if (fullname) targetFiles.add(fullname);
       }
     } catch {
-      const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
-      rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
+      // Ignore stack query errors and fall back to candidate files
+    }
+    for (const f of candidateFiles) {
+      if (f) targetFiles.add(f);
     }
 
-    const lines: SourceAssemblyLine[] = [];
+    for (const file of targetFiles) {
+      if (!this.fileAssemblyCache.has(file)) {
+        const parsed = await this.disassembleFileFunctions(file);
+        if (parsed.length > 0) {
+          this.fileAssemblyCache.set(file, parsed);
+        }
+      }
+    }
+
+    const allLines: SourceAssemblyLine[] = [];
+    for (const fileLines of this.fileAssemblyCache.values()) {
+      for (const item of fileLines) {
+        allLines.push({ ...item, pc });
+      }
+    }
+    if (allLines.length > 0) return allLines;
+
+    const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
+    const rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
+    return this.extractMixedLines(rec).map((item) => ({ ...item, pc }));
+  }
+
+  private async disassembleFileFunctions(fullname: string): Promise<Array<Omit<SourceAssemblyLine, 'pc'>>> {
+    let candidateLines: number[] = [];
+    try {
+      const symRec = await this.mi(`symbol-list-lines "${this.escapeMI(fullname)}"`);
+      const unique = new Set<number>();
+      for (const entry of this.asArray(symRec.results.lines)) {
+        const obj = this.asObject(entry);
+        const lineNo = Number(this.asString(obj?.line));
+        if (Number.isFinite(lineNo) && lineNo > 0) unique.add(lineNo);
+      }
+      candidateLines = [...unique].sort((a, b) => a - b);
+    } catch {
+      candidateLines = [1];
+    }
+
+    if (candidateLines.length === 0) return [];
+
+    const byLine = new Map<number, Omit<SourceAssemblyLine, 'pc'>>();
+    const covered = new Set<number>();
+
+    for (const startLine of candidateLines) {
+      if (covered.has(startLine)) continue;
+      covered.add(startLine);
+      try {
+        const rec = await this.mi(`data-disassemble -f "${this.escapeMI(fullname)}" -l ${startLine} -- 1`);
+        const entries = this.asArray(rec.results.asm_insns);
+        for (const entry of entries) {
+          const group = this.asObject(entry);
+          const source = this.asObject(group?.src_and_asm_line);
+          const ln = Number(this.asString(source?.line));
+          if (Number.isFinite(ln) && ln > 0) covered.add(ln);
+        }
+        for (const parsed of this.extractMixedLines(rec)) {
+          if (!byLine.has(parsed.line)) {
+            byLine.set(parsed.line, parsed);
+          }
+        }
+      } catch {
+        // Skip lines without an associated function body
+      }
+    }
+
+    return [...byLine.values()].sort((a, b) => a.line - b.line);
+  }
+
+  private extractMixedLines(rec: MIRecord): Array<Omit<SourceAssemblyLine, 'pc'>> {
+    const lines: Array<Omit<SourceAssemblyLine, 'pc'>> = [];
     for (const entry of this.asArray(rec.results.asm_insns)) {
       const group = this.asObject(entry);
       const source = this.asObject(group?.src_and_asm_line);
@@ -780,11 +922,13 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
       const line = Number(this.asString(source?.line));
       if (!rawFile || !Number.isFinite(line) || line < 1) continue;
       const file = path.resolve(this.root, rawFile);
-      const instructions = this.asArray(source?.line_asm_insn).map((item) => {
-        const asm = this.asObject(item);
-        return { address: this.asString(asm?.address), instruction: this.asString(asm?.inst).replace(/\t+/g, ' ') };
-      }).filter((instruction) => instruction.instruction.length > 0);
-      if (instructions.length) lines.push({ file, line, instructions, pc });
+      const instructions = this.asArray(source?.line_asm_insn)
+        .map((item) => {
+          const asm = this.asObject(item);
+          return { address: this.asString(asm?.address), instruction: this.asString(asm?.inst).replace(/\t+/g, ' ') };
+        })
+        .filter((instruction) => instruction.instruction.length > 0);
+      if (instructions.length) lines.push({ file, line, instructions });
     }
     return lines;
   }
@@ -806,6 +950,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.gdb = undefined;
     this.qemu = undefined;
     this.status = 'Disconnected';
+    this.fileAssemblyCache.clear();
     this.views?.clearSession();
     this.onResumed?.();
     this.sendEvent('terminated');

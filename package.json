@@ -114,13 +114,13 @@
             "type": "qemu-m3",
             "request": "launch",
             "name": "Debug Firmware",
-            "elfFile": "${workspaceFolder}/build/firmware.elf",
-            "qemuPath": "/usr/bin/qemu-system-arm",
-            "gdbPath": "/usr/bin/arm-none-eabi-gdb",
+            "elfFile": "${workspaceFolder}/${make:TARGET}",
+            "qemuPath": "${make:QEMU}",
+            "gdbPath": "${make:GDB}",
             "gdbPort": 3333,
-            "machine": "mps2-an385",
+            "machine": "${make:QEMU_MACH}",
             "buildCommand": "make -C ${workspaceFolder}",
-            "ledRegister": "0x40028000"
+            "ledRegister": "${make:LED_ADDR}"
           }
         ]
       }
