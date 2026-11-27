@@ -16,6 +16,7 @@ type Config = vscode.DebugConfiguration & {
   buildCommand?: string;
   ledRegister?: string;
   stopOnEntry?: boolean;
+  disassembly?: boolean;
 };
 
 interface DAPRequest {
@@ -25,11 +26,13 @@ interface DAPRequest {
   arguments?: any;
 }
 
-export interface SourceAssemblyLine {
-  file: string;
-  line: number;
-  instructions: Array<{ address: string; instruction: string }>;
-  pc: string;
+export interface FullDisassembly {
+  elfFile: string;
+  text: string;
+  pcToLine: Map<string, number>;
+  sourceToLine: Map<string, number>;
+  sourceLines: number[];
+  headerLines: number[];
 }
 
 const LOCALS_SCOPE_REF = 1;
@@ -57,7 +60,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   private stopWaiters: Array<() => void> = [];
   private breakpointsByFile = new Map<string, number[]>();
   private registerNames: string[] = [];
-  private fileAssemblyCache = new Map<string, Array<Omit<SourceAssemblyLine, 'pc'>>>();
+  private cachedDisassembly?: FullDisassembly;
   private activeFrameId = 0;
   private terminated = false;
   private disposed = false;
@@ -66,7 +69,8 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     private readonly views?: DebugViewSink,
     private readonly onDispose?: () => void,
     private readonly onStopped?: () => void,
-    private readonly onResumed?: () => void
+    private readonly onRunning?: () => void,
+    private readonly onTerminated?: () => void
   ) {}
 
   handleMessage(message: vscode.DebugProtocolMessage) {
@@ -127,6 +131,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           if (this.cfg.stopOnEntry === false) {
             await this.mi('exec-continue');
             this.status = 'Running';
+            this.onRunning?.();
           } else {
             this.stop('entry');
           }
@@ -141,7 +146,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
         case 'continue':
           await this.mi('exec-continue');
           this.status = 'Running';
-          this.onResumed?.();
+          this.onRunning?.();
           this.reply(m, { allThreadsContinued: true });
           break;
         case 'pause':
@@ -152,7 +157,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-next-instruction' : 'exec-next';
           await this.mi(cmd);
           this.status = 'Running';
-          this.onResumed?.();
+          this.onRunning?.();
           this.reply(m);
           break;
         }
@@ -160,14 +165,14 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-step-instruction' : 'exec-step';
           await this.mi(cmd);
           this.status = 'Running';
-          this.onResumed?.();
+          this.onRunning?.();
           this.reply(m);
           break;
         }
         case 'stepOut':
           await this.mi('exec-finish');
           this.status = 'Running';
-          this.onResumed?.();
+          this.onRunning?.();
           this.reply(m);
           break;
         case 'setBreakpoints':
@@ -210,7 +215,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private async start(attach: boolean) {
     this.terminated = false;
-    this.fileAssemblyCache.clear();
+    this.cachedDisassembly = undefined;
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
     const baseEnv = this.buildEnv();
     let makeVars: Record<string, string> | undefined;
@@ -823,114 +828,166 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.reply(m, { instructions: insns });
   }
 
-  async getMixedSourceAssembly(candidateFiles: string[] = []): Promise<SourceAssemblyLine[]> {
-    if (this.status !== 'Stopped' || this.terminated) return [];
-    const pcRec = await this.mi('data-evaluate-expression "(unsigned int)$pc"');
-    const pcNumber = Number(this.asString(pcRec.results.value));
-    if (!Number.isFinite(pcNumber)) return [];
-    const pc = `0x${(pcNumber >>> 0).toString(16).padStart(8, '0')}`;
-
-    const targetFiles = new Set<string>();
-    try {
-      const frameRec = await this.mi('stack-list-frames');
-      for (const entry of this.asArray(frameRec.results.stack)) {
-        const rawFrame = this.asObject(entry);
-        const frame = rawFrame?.frame ? this.asObject(rawFrame.frame) : rawFrame;
-        const fullname = this.asString(frame?.fullname);
-        if (fullname) targetFiles.add(fullname);
-      }
-    } catch {
-      // Ignore stack query errors and fall back to candidate files
-    }
-    for (const f of candidateFiles) {
-      if (f) targetFiles.add(f);
-    }
-
-    for (const file of targetFiles) {
-      if (!this.fileAssemblyCache.has(file)) {
-        const parsed = await this.disassembleFileFunctions(file);
-        if (parsed.length > 0) {
-          this.fileAssemblyCache.set(file, parsed);
-        }
-      }
-    }
-
-    const allLines: SourceAssemblyLine[] = [];
-    for (const fileLines of this.fileAssemblyCache.values()) {
-      for (const item of fileLines) {
-        allLines.push({ ...item, pc });
-      }
-    }
-    if (allLines.length > 0) return allLines;
-
-    const end = `0x${((pcNumber >>> 0) + 160).toString(16)}`;
-    const rec = await this.mi(`data-disassemble -s "${pc}" -e "${end}" -- 1`);
-    return this.extractMixedLines(rec).map((item) => ({ ...item, pc }));
+  isDisassemblyEnabled(): boolean {
+    return this.cfg?.disassembly !== false;
   }
 
-  private async disassembleFileFunctions(fullname: string): Promise<Array<Omit<SourceAssemblyLine, 'pc'>>> {
-    let candidateLines: number[] = [];
+  isActive(): boolean {
+    return !this.terminated && this.status !== 'Disconnected';
+  }
+
+  isStopped(): boolean {
+    return this.status === 'Stopped' && !this.terminated;
+  }
+
+  async getCurrentPc(): Promise<string | undefined> {
+    if (!this.isStopped()) return undefined;
     try {
-      const symRec = await this.mi(`symbol-list-lines "${this.escapeMI(fullname)}"`);
-      const unique = new Set<number>();
-      for (const entry of this.asArray(symRec.results.lines)) {
-        const obj = this.asObject(entry);
-        const lineNo = Number(this.asString(obj?.line));
-        if (Number.isFinite(lineNo) && lineNo > 0) unique.add(lineNo);
-      }
-      candidateLines = [...unique].sort((a, b) => a - b);
+      const pcRec = await this.mi('data-evaluate-expression "(unsigned int)$pc"');
+      const pcNumber = Number(this.asString(pcRec.results.value));
+      if (!Number.isFinite(pcNumber)) return undefined;
+      return `0x${(pcNumber >>> 0).toString(16).padStart(8, '0')}`;
     } catch {
-      candidateLines = [1];
+      return undefined;
     }
+  }
 
-    if (candidateLines.length === 0) return [];
+  async getFullDisassembly(): Promise<FullDisassembly | undefined> {
+    if (!this.isDisassemblyEnabled() || !this.cfg?.elfFile || this.terminated) return undefined;
+    if (this.cachedDisassembly) return this.cachedDisassembly;
 
-    const byLine = new Map<number, Omit<SourceAssemblyLine, 'pc'>>();
-    const covered = new Set<number>();
+    const objdump = this.findObjdumpBinary();
+    const env = this.buildEnv();
+    const raw = await new Promise<string>((resolve, reject) => {
+      cp.execFile(
+        objdump,
+        ['-d', '-S', '-l', this.cfg.elfFile!],
+        { cwd: this.root, env, maxBuffer: 32 * 1024 * 1024 },
+        (err, stdout) => {
+          if (err) reject(err);
+          else resolve(stdout);
+        }
+      );
+    });
 
-    for (const startLine of candidateLines) {
-      if (covered.has(startLine)) continue;
-      covered.add(startLine);
+    this.cachedDisassembly = this.parseObjdump(raw, this.cfg.elfFile);
+    return this.cachedDisassembly;
+  }
+
+  private findObjdumpBinary(): string {
+    const gdbPath = this.cfg.gdbPath || '';
+    if (gdbPath.endsWith('-gdb')) {
+      const sibling = gdbPath.slice(0, -4) + '-objdump';
+      if (fs.existsSync(sibling)) return sibling;
+    }
+    return this.findBinary('arm-none-eabi-objdump');
+  }
+
+  private parseObjdump(raw: string, elfFile: string): FullDisassembly {
+    const outLines: string[] = [];
+    const pcToLine = new Map<string, number>();
+    const sourceToLine = new Map<string, number>();
+    const sourceByName = new Map<string, Set<string>>();
+    const sourceLines: number[] = [];
+    const headerLines: number[] = [];
+
+    const canonical = (p: string) => {
+      const resolved = path.resolve(this.root, p);
       try {
-        const rec = await this.mi(`data-disassemble -f "${this.escapeMI(fullname)}" -l ${startLine} -- 1`);
-        const entries = this.asArray(rec.results.asm_insns);
-        for (const entry of entries) {
-          const group = this.asObject(entry);
-          const source = this.asObject(group?.src_and_asm_line);
-          const ln = Number(this.asString(source?.line));
-          if (Number.isFinite(ln) && ln > 0) covered.add(ln);
-        }
-        for (const parsed of this.extractMixedLines(rec)) {
-          if (!byLine.has(parsed.line)) {
-            byLine.set(parsed.line, parsed);
-          }
-        }
+        return fs.realpathSync(resolved);
       } catch {
-        // Skip lines without an associated function body
+        return resolved;
+      }
+    };
+
+    const recordSource = (filePath: string, lineNo: number, targetLine: number) => {
+      const key = `${filePath}:${lineNo}`;
+      if (!sourceToLine.has(key)) sourceToLine.set(key, targetLine);
+      const base = path.basename(filePath);
+      if (!sourceByName.has(base)) sourceByName.set(base, new Set());
+      sourceByName.get(base)!.add(filePath);
+    };
+
+    let pendingSource: { file: string; line: number } | undefined;
+    let inSection = false;
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line && !inSection) continue;
+      if (line.startsWith('Disassembly of section ')) {
+        inSection = true;
+        pendingSource = undefined;
+        if (outLines.length > 0) outLines.push('');
+        outLines.push(line);
+        headerLines.push(outLines.length - 1);
+        continue;
+      }
+      if (!inSection) continue;
+
+      const headerMatch = line.match(/^([0-9a-fA-F]+)\s+<([^>]+)>:$/);
+      if (headerMatch) {
+        pendingSource = undefined;
+        if (outLines.length > 0 && outLines[outLines.length - 1] !== '') outLines.push('');
+        const addr = `0x${(parseInt(headerMatch[1], 16) >>> 0).toString(16).padStart(8, '0')}`;
+        outLines.push(`${addr} <${headerMatch[2]}>:`);
+        headerLines.push(outLines.length - 1);
+        continue;
+      }
+
+      const insnMatch = line.match(/^\s*([0-9a-fA-F]+):\s+[0-9a-fA-F ]+?\t(.*)$/);
+      if (insnMatch) {
+        const addr = `0x${(parseInt(insnMatch[1], 16) >>> 0).toString(16).padStart(8, '0')}`;
+        const inst = insnMatch[2].replace(/\t+/g, ' ').replace(/\s+/g, ' ').trim();
+        const lineIdx = outLines.length;
+        outLines.push(`    ${addr}  ${inst}`);
+        pcToLine.set(addr, lineIdx);
+        if (pendingSource) {
+          recordSource(pendingSource.file, pendingSource.line, lineIdx);
+        }
+        continue;
+      }
+
+      const locMatch = line.match(/^(.+?):(\d+)(?:\s+\(discriminator\s+\d+\))?$/);
+      if (locMatch && /\.(?:c|cc|cpp|cxx|h|hpp|s|S|asm)$/i.test(locMatch[1])) {
+        pendingSource = { file: canonical(locMatch[1]), line: Number(locMatch[2]) };
+        continue;
+      }
+
+      if (/^[A-Za-z_][A-Za-z0-9_]*\(\):$/.test(line.trim())) {
+        continue;
+      }
+
+      if (pendingSource && line.length > 0) {
+        const lineIdx = outLines.length;
+        outLines.push(`  ; ${String(pendingSource.line).padStart(3)} | ${line}`);
+        sourceLines.push(lineIdx);
+        recordSource(pendingSource.file, pendingSource.line, lineIdx);
+      } else if (line === '...') {
+        outLines.push('    ...');
       }
     }
 
-    return [...byLine.values()].sort((a, b) => a.line - b.line);
-  }
-
-  private extractMixedLines(rec: MIRecord): Array<Omit<SourceAssemblyLine, 'pc'>> {
-    const lines: Array<Omit<SourceAssemblyLine, 'pc'>> = [];
-    for (const entry of this.asArray(rec.results.asm_insns)) {
-      const group = this.asObject(entry);
-      const source = this.asObject(group?.src_and_asm_line);
-      const rawFile = this.asString(source?.fullname) || this.asString(source?.file);
-      const line = Number(this.asString(source?.line));
-      if (!rawFile || !Number.isFinite(line) || line < 1) continue;
-      const file = path.resolve(this.root, rawFile);
-      const instructions = this.asArray(source?.line_asm_insn)
-        .map((item) => {
-          const asm = this.asObject(item);
-          return { address: this.asString(asm?.address), instruction: this.asString(asm?.inst).replace(/\t+/g, ' ') };
-        })
-        .filter((instruction) => instruction.instruction.length > 0);
-      if (instructions.length) lines.push({ file, line, instructions });
+    // Add basename fallback keys when a filename maps uniquely in the ELF
+    for (const [base, paths] of sourceByName) {
+      if (paths.size !== 1) continue;
+      const [onlyPath] = paths;
+      const prefix = `${onlyPath}:`;
+      for (const [k, v] of sourceToLine) {
+        if (k.startsWith(prefix)) {
+          const linePart = k.slice(prefix.length);
+          const baseKey = `${base}:${linePart}`;
+          if (!sourceToLine.has(baseKey)) sourceToLine.set(baseKey, v);
+        }
+      }
     }
-    return lines;
+
+    return {
+      elfFile,
+      text: outLines.join('\n'),
+      pcToLine,
+      sourceToLine,
+      sourceLines,
+      headerLines,
+    };
   }
 
   private stop(reason: string) {
@@ -950,9 +1007,9 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.gdb = undefined;
     this.qemu = undefined;
     this.status = 'Disconnected';
-    this.fileAssemblyCache.clear();
+    this.cachedDisassembly = undefined;
     this.views?.clearSession();
-    this.onResumed?.();
+    this.onTerminated?.();
     this.sendEvent('terminated');
   }
 

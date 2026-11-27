@@ -75,6 +75,11 @@
               },
               "stopOnEntry": {
                 "type": "boolean"
+              },
+              "disassembly": {
+                "type": "boolean",
+                "default": true,
+                "description": "Open full mixed source/disassembly view while debugging"
               }
             }
           },
@@ -105,6 +110,11 @@
               },
               "gdbPort": {
                 "type": "number"
+              },
+              "disassembly": {
+                "type": "boolean",
+                "default": true,
+                "description": "Open full mixed source/disassembly view while debugging"
               }
             }
           }
@@ -120,7 +130,8 @@
             "gdbPort": 3333,
             "machine": "${make:QEMU_MACH}",
             "buildCommand": "make -C ${workspaceFolder}",
-            "ledRegister": "${make:LED_ADDR}"
+            "ledRegister": "${make:LED_ADDR}",
+            "disassembly": true
           }
         ]
       }

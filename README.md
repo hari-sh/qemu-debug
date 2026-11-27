@@ -13,9 +13,10 @@ VS Code debugging extension for ARM Cortex-M3 firmware running on QEMU (`mps2-an
 - **Memory View**
   - Defaults to `0x00000000` and shows **10 rows** (`80` bytes total), incrementing by `+8` bytes per row with two 4-byte words (`addr: word0  word1`).
   - Includes an inline start-address bar (`Enter` or **Read**) and inline click-to-edit on any 4-byte word (`Enter` or click outside to commit, `Escape` to cancel).
-- **Mixed C + Tabbed Disassembly**
-  - Displays a compact `▸` / `▾` arrow above every compiled line across all functions in the file.
-  - Clicking `▸` opens a read-only mixed source + tabbed disassembly view (`qemu-asm`) beside the editor with `▶` marking the current `$pc` instruction and live updates while stepping.
+- **Full Mixed Source & Disassembly View**
+  - Controlled by `"disassembly": true` in `launch.json` (enabled by default; set `"disassembly": false` to disable).
+  - Opens a read-only full disassembly file (`qemu-disasm`) beside your C source **only while debugging** (closes automatically when the debug session ends), interleaving source lines right above their instructions (`arm-none-eabi-objdump -d -S -l`).
+  - Automatically highlights and scrolls to the active `$pc` instruction on every breakpoint, step, or pause, and syncs when you click lines in your C source while stopped.
 - **`Makefile` Variable Resolution (`${make:VAR}`)**
   - Runs `buildCommand` before launch and resolves `${make:VAR}` placeholders directly from the workspace `Makefile` (including nested variables such as `TARGET = $(BUILD_DIR)/rtos.elf`).
 
@@ -86,7 +87,8 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
       "gdbPort": 3333,
       "machine": "${make:QEMU_MACH}",
       "buildCommand": "make -C ${workspaceFolder}",
-      "ledRegister": "${make:LED_ADDR}"
+      "ledRegister": "${make:LED_ADDR}",
+      "disassembly": true
     }
   ]
 }
@@ -100,7 +102,7 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 2. In the **Run and Debug** sidebar:
    - **Registers**: View the live 8-LED strip at the top and edit registers inline by clicking any hex value (`Enter` or click outside to apply, `Escape` to cancel).
    - **Memory**: Enter any hex/decimal address and press `Enter` or **Read** to inspect 10 eight-byte rows; click either 4-byte word on a row to edit memory inline.
-3. Click **`▸`** above any compiled C line to open/collapse tabbed multi-line assembly beside the source editor.
+3. With `"disassembly": true`, the full mixed Disassembly tab opens beside your source file while stopped—highlighting the active `$pc` instruction on breakpoints/steps and scrolling when you click lines in C source. It closes automatically when debugging ends.
 4. In the **Debug Console**, evaluate C expressions directly or prefix raw GDB commands with `>` (for example, `>info breakpoints`).
 
 ---
@@ -122,6 +124,7 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 | `buildCommand` | No | — | Shell command run before starting QEMU (e.g. `"make -C ${workspaceFolder}"`) |
 | `ledRegister` | No | `0x40028000` | 32-bit MMIO address monitored for the 8-LED strip |
 | `stopOnEntry` | No | `true` | Halt at `Reset_Handler` on start (`false` continues immediately) |
+| `disassembly` | No | `true` | Open full mixed source/disassembly view while debugging |
 
 ### `attach`
 
@@ -133,6 +136,7 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 | `elfFile` | No | — | Path to `.elf` symbols file |
 | `gdbPath` | No | `arm-none-eabi-gdb` | Path or binary name for ARM GDB |
 | `gdbPort` | No | `3333` | TCP port of the running QEMU GDB server |
+| `disassembly` | No | `true` | Open full mixed source/disassembly view while debugging |
 
 ---
 

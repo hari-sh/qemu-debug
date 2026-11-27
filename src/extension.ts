@@ -1,193 +1,228 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { QemuDebugAdapter } from './session';
+import { FullDisassembly, QemuDebugAdapter } from './session';
 import { normalizeAddress, QemuDebugViews } from './tree';
 
-const ASM_SCHEME = 'qemu-asm';
+const DISASM_SCHEME = 'qemu-disasm';
 
-class SourceAssemblyDecorations
-  implements vscode.CodeLensProvider, vscode.TextDocumentContentProvider, vscode.Disposable
-{
-  private groups: Awaited<ReturnType<QemuDebugAdapter['getMixedSourceAssembly']>> = [];
-  private readonly expanded = new Map<string, Set<number>>();
-  private readonly lensesChanged = new vscode.EventEmitter<void>();
+/**
+ * Manages the full mixed source/assembly editor during active debug sessions.
+ */
+class DisassemblyViewController implements vscode.TextDocumentContentProvider, vscode.Disposable {
   private readonly docChanged = new vscode.EventEmitter<vscode.Uri>();
-  private readonly pcLineDecoration = vscode.window.createTextEditorDecorationType({
+  readonly onDidChange = this.docChanged.event;
+
+  private readonly headerDecoration = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    fontWeight: 'bold',
+    color: new vscode.ThemeColor('debugTokenExpression.name'),
+  });
+  private readonly sourceOverlayDecoration = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    fontStyle: 'italic',
+    color: new vscode.ThemeColor('editorCodeLens.foreground'),
+  });
+  private readonly pcDecoration = vscode.window.createTextEditorDecorationType({
     isWholeLine: true,
     backgroundColor: new vscode.ThemeColor('editor.stackFrameHighlightBackground'),
   });
-  private readonly asmLineDecoration = vscode.window.createTextEditorDecorationType({
+  private readonly cursorSyncDecoration = vscode.window.createTextEditorDecorationType({
     isWholeLine: true,
-    color: new vscode.ThemeColor('editorCodeLens.foreground'),
+    backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
   });
 
-  readonly onDidChangeCodeLenses = this.lensesChanged.event;
-  readonly onDidChange = this.docChanged.event;
+  private currentDisasm?: FullDisassembly;
+  private currentPcLine?: number;
+  private currentCursorLine?: number;
+  private readonly subscriptions: vscode.Disposable[];
 
-  async refresh(adapter: QemuDebugAdapter) {
+  constructor(private readonly getActiveAdapter: () => QemuDebugAdapter | undefined) {
+    this.subscriptions = [
+      vscode.window.onDidChangeTextEditorSelection((e) => {
+        this.onSourceSelectionChanged(e);
+      }),
+      vscode.window.onDidChangeVisibleTextEditors(() => {
+        this.applyDecorations();
+      }),
+    ];
+  }
+
+  provideTextDocumentContent(): string {
+    return this.currentDisasm?.text || '';
+  }
+
+  async syncOnStop(adapter: QemuDebugAdapter) {
+    if (!adapter.isDisassemblyEnabled()) return;
     try {
-      const visibleSourceFiles = vscode.window.visibleTextEditors
-        .filter((e) => e.document.uri.scheme === 'file')
-        .map((e) => e.document.uri.fsPath);
-      this.groups = await adapter.getMixedSourceAssembly(visibleSourceFiles);
-      this.lensesChanged.fire();
-      for (const file of this.expanded.keys()) {
-        const asmUri = this.asmUriFor(file);
-        this.docChanged.fire(asmUri);
+      const disasm = await adapter.getFullDisassembly();
+      if (!disasm || !adapter.isStopped()) return;
+
+      const isNew = this.currentDisasm?.elfFile !== disasm.elfFile;
+      this.currentDisasm = disasm;
+      this.currentCursorLine = undefined;
+      const uri = this.uriFor(disasm.elfFile);
+      if (isNew) this.docChanged.fire(uri);
+
+      const pc = await adapter.getCurrentPc();
+      this.currentPcLine = pc ? disasm.pcToLine.get(pc) : undefined;
+
+      const editor = await this.ensureOpen(uri);
+      this.applyDecorations();
+      if (editor && this.currentPcLine !== undefined) {
+        const pos = new vscode.Position(this.currentPcLine, 0);
+        editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
       }
-      this.applyAsmDecorations();
     } catch {
-      /* Source mapping is optional; retain normal debug behavior. */
+      /* Disassembly view is optional; keep normal debug session working. */
     }
   }
 
-  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
-    if (document.uri.scheme === ASM_SCHEME) return [];
-    const openLines = this.expanded.get(document.uri.fsPath);
-    return this.groups
-      .filter((item) => item.file === document.uri.fsPath && item.line <= document.lineCount)
-      .map((item) => {
-        const isExpanded = openLines?.has(item.line) ?? false;
-        return new vscode.CodeLens(new vscode.Range(item.line - 1, 0, item.line - 1, 0), {
-          title: isExpanded ? '▾' : '▸',
-          command: 'qemu-m3.toggleAssembly',
-          arguments: [document.uri, item.line],
-          tooltip: isExpanded ? 'Hide disassembly' : 'Show disassembly',
-        });
-      });
+  clearRunState() {
+    this.currentPcLine = undefined;
+    this.currentCursorLine = undefined;
+    this.applyDecorations();
   }
 
-  provideTextDocumentContent(uri: vscode.Uri): string {
-    const filePath = uri.fsPath;
-    const openDoc = vscode.workspace.textDocuments.find(
-      (d) => d.uri.scheme === 'file' && d.uri.fsPath === filePath
-    );
-    const rawText = openDoc ? openDoc.getText() : fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-    const srcLines = rawText.split(/\r?\n/);
-    const width = Math.max(2, String(srcLines.length).length);
-    const expandedLines = this.expanded.get(filePath) || new Set<number>();
-    const byLine = new Map<number, (typeof this.groups)[number]>();
-    for (const g of this.groups) {
-      if (g.file === filePath) byLine.set(g.line, g);
-    }
+  async closeAndClear() {
+    this.currentDisasm = undefined;
+    this.currentPcLine = undefined;
+    this.currentCursorLine = undefined;
+    this.applyDecorations();
 
-    const out: string[] = [];
-    for (let i = 0; i < srcLines.length; i++) {
-      const lineNo = i + 1;
-      const lineText = srcLines[i];
-      out.push(`${String(lineNo).padStart(width)} | ${lineText}`);
-
-      if (expandedLines.has(lineNo)) {
-        const group = byLine.get(lineNo);
-        if (group) {
-          const indent = lineText.match(/^\s*/)?.[0] || '';
-          const pad = ' '.repeat(width);
-          for (const inst of group.instructions) {
-            const mark = inst.address === group.pc ? '▶' : ' ';
-            out.push(`${pad} | ${indent}\t${mark} ${inst.address}  ${inst.instruction}`);
+    for (const group of vscode.window.tabGroups?.all || []) {
+      for (const tab of group.tabs) {
+        const input = tab.input as { uri?: vscode.Uri } | undefined;
+        if (input?.uri?.scheme === DISASM_SCHEME) {
+          try {
+            await vscode.window.tabGroups.close(tab, true);
+          } catch {
+            // Ignore close errors if tab already closed
           }
         }
       }
     }
-    return out.join('\n');
   }
 
-  async toggle(uri: vscode.Uri, line: number) {
-    const filePath = uri.fsPath;
-    let lines = this.expanded.get(filePath);
-    if (!lines) {
-      lines = new Set<number>();
-      this.expanded.set(filePath, lines);
-    }
-    if (lines.has(line)) {
-      lines.delete(line);
-      if (lines.size === 0) this.expanded.delete(filePath);
-    } else {
-      lines.add(line);
-    }
+  private onSourceSelectionChanged(e: vscode.TextEditorSelectionChangeEvent) {
+    const adapter = this.getActiveAdapter();
+    if (!adapter || !adapter.isActive() || !adapter.isDisassemblyEnabled() || !this.currentDisasm) return;
+    if (e.textEditor.document.uri.scheme !== 'file') return;
 
-    this.lensesChanged.fire();
-    const asmUri = this.asmUriFor(filePath);
-    this.docChanged.fire(asmUri);
+    const disasmEditor = vscode.window.visibleTextEditors.find(
+      (ed) => ed.document.uri.scheme === DISASM_SCHEME
+    );
+    if (!disasmEditor) return;
 
-    if (lines.has(line)) {
-      const doc = await vscode.workspace.openTextDocument(asmUri);
-      const editor = await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.Beside,
-        preserveFocus: true,
-        preview: true,
-      });
-      const targetRow = this.findRenderedLine(doc, line);
-      if (targetRow >= 0) {
-        const pos = new vscode.Position(targetRow, 0);
-        editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-      }
-      this.applyAsmDecorations();
-    } else {
-      this.applyAsmDecorations();
+    const rawPath = path.resolve(e.textEditor.document.uri.fsPath);
+    let realPath = rawPath;
+    try {
+      realPath = fs.realpathSync(rawPath);
+    } catch {
+      // Keep resolved path
     }
+    const baseName = path.basename(rawPath);
+    const clickedLine = e.selections[0]?.active.line + 1;
+    if (!clickedLine) return;
+
+    const offsets = [0, 1, -1, 2, -2, 3, -3];
+    let targetLine: number | undefined;
+    for (const offset of offsets) {
+      const ln = clickedLine + offset;
+      if (ln < 1) continue;
+      targetLine =
+        this.currentDisasm.sourceToLine.get(`${realPath}:${ln}`) ??
+        this.currentDisasm.sourceToLine.get(`${rawPath}:${ln}`) ??
+        this.currentDisasm.sourceToLine.get(`${baseName}:${ln}`);
+      if (targetLine !== undefined) break;
+    }
+    if (targetLine === undefined) return;
+
+    this.currentCursorLine = targetLine;
+    this.applyDecorations();
+    const pos = new vscode.Position(targetLine, 0);
+    disasmEditor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
   }
 
-  private applyAsmDecorations() {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.scheme !== ASM_SCHEME) continue;
-      const pcRanges: vscode.Range[] = [];
-      const asmRanges: vscode.Range[] = [];
-      for (let i = 0; i < editor.document.lineCount; i++) {
-        const text = editor.document.lineAt(i).text;
-        if (/^\s+\|\s+▶\s+0x[0-9a-fA-F]+/.test(text)) {
-          pcRanges.push(new vscode.Range(i, 0, i, text.length));
-        } else if (/^\s+\|\s+0x[0-9a-fA-F]+/.test(text)) {
-          asmRanges.push(new vscode.Range(i, 0, i, text.length));
+  private async ensureOpen(uri: vscode.Uri): Promise<vscode.TextEditor | undefined> {
+    const existingEditor = vscode.window.visibleTextEditors.find(
+      (ed) => ed.document.uri.scheme === DISASM_SCHEME
+    );
+    if (existingEditor) return existingEditor;
+
+    let targetColumn = vscode.ViewColumn.Beside;
+    for (const group of vscode.window.tabGroups?.all || []) {
+      for (const tab of group.tabs) {
+        const input = tab.input as { uri?: vscode.Uri } | undefined;
+        if (input?.uri?.scheme === DISASM_SCHEME) {
+          targetColumn = group.viewColumn;
+          break;
         }
       }
-      editor.setDecorations(this.pcLineDecoration, pcRanges);
-      editor.setDecorations(this.asmLineDecoration, asmRanges);
     }
-  }
 
-  private findRenderedLine(doc: vscode.TextDocument, sourceLine: number): number {
-    const prefix = new RegExp(`^\\s*${sourceLine}\\s\\|`);
-    for (let i = 0; i < doc.lineCount; i++) {
-      if (prefix.test(doc.lineAt(i).text)) return i;
-    }
-    return -1;
-  }
-
-  private asmUriFor(filePath: string): vscode.Uri {
-    return vscode.Uri.from({
-      scheme: ASM_SCHEME,
-      path: filePath,
-      query: `${path.basename(filePath)} [Assembly]`,
+    const doc = await vscode.workspace.openTextDocument(uri);
+    return vscode.window.showTextDocument(doc, {
+      viewColumn: targetColumn,
+      preserveFocus: true,
+      preview: false,
     });
   }
 
-  clear() {
-    this.groups = [];
-    this.expanded.clear();
+  private applyDecorations() {
     for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.scheme === ASM_SCHEME) {
-        editor.setDecorations(this.pcLineDecoration, []);
-        editor.setDecorations(this.asmLineDecoration, []);
+      if (editor.document.uri.scheme !== DISASM_SCHEME) continue;
+      if (!this.currentDisasm) {
+        editor.setDecorations(this.headerDecoration, []);
+        editor.setDecorations(this.sourceOverlayDecoration, []);
+        editor.setDecorations(this.pcDecoration, []);
+        editor.setDecorations(this.cursorSyncDecoration, []);
+        continue;
       }
+
+      const toRanges = (lines: number[]) =>
+        lines
+          .filter((l) => l >= 0 && l < editor.document.lineCount)
+          .map((l) => new vscode.Range(l, 0, l, editor.document.lineAt(l).text.length));
+
+      editor.setDecorations(this.headerDecoration, toRanges(this.currentDisasm.headerLines));
+      editor.setDecorations(this.sourceOverlayDecoration, toRanges(this.currentDisasm.sourceLines));
+      editor.setDecorations(
+        this.pcDecoration,
+        this.currentPcLine !== undefined ? toRanges([this.currentPcLine]) : []
+      );
+      editor.setDecorations(
+        this.cursorSyncDecoration,
+        this.currentCursorLine !== undefined && this.currentCursorLine !== this.currentPcLine
+          ? toRanges([this.currentCursorLine])
+          : []
+      );
     }
-    this.lensesChanged.fire();
+  }
+
+  private uriFor(elfFile: string): vscode.Uri {
+    return vscode.Uri.from({
+      scheme: DISASM_SCHEME,
+      path: `${elfFile}.disasm`,
+      query: `${path.basename(elfFile)} [Disassembly]`,
+    });
   }
 
   dispose() {
-    this.clear();
-    this.pcLineDecoration.dispose();
-    this.asmLineDecoration.dispose();
-    this.lensesChanged.dispose();
+    void this.closeAndClear();
+    for (const s of this.subscriptions) s.dispose();
+    this.headerDecoration.dispose();
+    this.sourceOverlayDecoration.dispose();
+    this.pcDecoration.dispose();
+    this.cursorSyncDecoration.dispose();
     this.docChanged.dispose();
   }
 }
 
 export function activate(context: vscode.ExtensionContext) {
   const views = new QemuDebugViews();
-  const assembly = new SourceAssemblyDecorations();
   let activeAdapter: QemuDebugAdapter | undefined;
+  const disasmView = new DisassemblyViewController(() => activeAdapter);
 
   views.setActionHandler({
     onWriteRegister: async (name, value) => {
@@ -210,12 +245,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     views,
-    assembly,
-    vscode.workspace.registerTextDocumentContentProvider(ASM_SCHEME, assembly),
-    vscode.languages.registerCodeLensProvider(
-      [{ language: 'c' }, { language: 'cpp' }, { language: 'asm' }, { language: 'assembly' }],
-      assembly
-    ),
+    disasmView,
+    vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasmView),
     vscode.window.registerWebviewViewProvider('qemu-m3.registersView', views.registersProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
@@ -231,8 +262,9 @@ export function activate(context: vscode.ExtensionContext) {
           () => {
             if (activeAdapter === adapter) activeAdapter = undefined;
           },
-          () => void assembly.refresh(adapter),
-          () => assembly.clear()
+          () => void disasmView.syncOnStop(adapter),
+          () => disasmView.clearRunState(),
+          () => void disasmView.closeAndClear()
         );
         activeAdapter = adapter;
         return new vscode.DebugAdapterInlineImplementation(adapter);
@@ -242,10 +274,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('qemu-m3.refreshViews', async () => {
       if (!activeAdapter) return;
       await activeAdapter.refreshPeripheralViews();
-    }),
-    vscode.commands.registerCommand('qemu-m3.toggleAssembly', (uri: vscode.Uri, line: number) =>
-      assembly.toggle(uri, line)
-    )
+    })
   );
 }
 
