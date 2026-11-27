@@ -1,228 +1,167 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { FullDisassembly, QemuDebugAdapter } from './session';
+import { QemuDebugAdapter } from './session';
 import { normalizeAddress, QemuDebugViews } from './tree';
 
-const DISASM_SCHEME = 'qemu-disasm';
-
 /**
- * Manages the full mixed source/assembly editor during active debug sessions.
+ * Ensures the active stack frame's source file stays open on top in the first pane
+ * and VS Code's built-in Disassembly View stays open on top in the second pane
+ * whenever debugging stops (unless `disassembly: false`), closing Disassembly on end.
  */
-class DisassemblyViewController implements vscode.TextDocumentContentProvider, vscode.Disposable {
-  private readonly docChanged = new vscode.EventEmitter<vscode.Uri>();
-  readonly onDidChange = this.docChanged.event;
+class BuiltinDisassemblyController {
+  private pending: Promise<void> = Promise.resolve();
+  private openCommand?: string;
+  private lastSyncedSourceKey?: string;
 
-  private readonly headerDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    fontWeight: 'bold',
-    color: new vscode.ThemeColor('debugTokenExpression.name'),
-  });
-  private readonly sourceOverlayDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    fontStyle: 'italic',
-    color: new vscode.ThemeColor('editorCodeLens.foreground'),
-  });
-  private readonly pcDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    backgroundColor: new vscode.ThemeColor('editor.stackFrameHighlightBackground'),
-  });
-  private readonly cursorSyncDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
-  });
-
-  private currentDisasm?: FullDisassembly;
-  private currentPcLine?: number;
-  private currentCursorLine?: number;
-  private readonly subscriptions: vscode.Disposable[];
-
-  constructor(private readonly getActiveAdapter: () => QemuDebugAdapter | undefined) {
-    this.subscriptions = [
-      vscode.window.onDidChangeTextEditorSelection((e) => {
-        this.onSourceSelectionChanged(e);
-      }),
-      vscode.window.onDidChangeVisibleTextEditors(() => {
-        this.applyDecorations();
-      }),
-    ];
+  onStopped(adapter: QemuDebugAdapter, frameId?: number): Promise<void> {
+    this.pending = this.pending
+      .catch(() => undefined)
+      .then(() => this.ensurePanes(adapter, frameId));
+    return this.pending;
   }
 
-  provideTextDocumentContent(): string {
-    return this.currentDisasm?.text || '';
+  onTerminated(): Promise<void> {
+    this.lastSyncedSourceKey = undefined;
+    this.pending = this.pending
+      .catch(() => undefined)
+      .then(() => this.closeDisassemblyTab());
+    return this.pending;
   }
 
-  async syncOnStop(adapter: QemuDebugAdapter) {
+  private async ensurePanes(adapter: QemuDebugAdapter, frameId = 0): Promise<void> {
     if (!adapter.isDisassemblyEnabled()) return;
+
     try {
-      const disasm = await adapter.getFullDisassembly();
-      if (!disasm || !adapter.isStopped()) return;
+      const disasmBefore = this.findDisassemblyTab();
+      const wasFocusedInDisassembly = Boolean(
+        disasmBefore &&
+          vscode.window.tabGroups.activeTabGroup === disasmBefore.group &&
+          disasmBefore.isActive
+      );
 
-      const isNew = this.currentDisasm?.elfFile !== disasm.elfFile;
-      this.currentDisasm = disasm;
-      this.currentCursorLine = undefined;
-      const uri = this.uriFor(disasm.elfFile);
-      if (isNew) this.docChanged.fire(uri);
-
-      const pc = await adapter.getCurrentPc();
-      this.currentPcLine = pc ? disasm.pcToLine.get(pc) : undefined;
-
-      const editor = await this.ensureOpen(uri);
-      this.applyDecorations();
-      if (editor && this.currentPcLine !== undefined) {
-        const pos = new vscode.Position(this.currentPcLine, 0);
-        editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+      const src = adapter.getSourceLocation(frameId);
+      if (src) {
+        await this.ensureSourceInFirstPane(adapter.getStopSeq(), frameId, src.path, src.line);
       }
+
+      await this.ensureDisassemblyInSecondPane(wasFocusedInDisassembly);
     } catch {
-      /* Disassembly view is optional; keep normal debug session working. */
+      /* Built-in Disassembly View remains manually accessible from editor context menu. */
     }
   }
 
-  clearRunState() {
-    this.currentPcLine = undefined;
-    this.currentCursorLine = undefined;
-    this.applyDecorations();
-  }
+  private async ensureSourceInFirstPane(
+    stopSeq: number,
+    frameId: number,
+    sourcePath: string,
+    line: number
+  ): Promise<void> {
+    if (typeof vscode.window.showTextDocument !== 'function') return;
 
-  async closeAndClear() {
-    this.currentDisasm = undefined;
-    this.currentPcLine = undefined;
-    this.currentCursorLine = undefined;
-    this.applyDecorations();
-
-    for (const group of vscode.window.tabGroups?.all || []) {
-      for (const tab of group.tabs) {
-        const input = tab.input as { uri?: vscode.Uri } | undefined;
-        if (input?.uri?.scheme === DISASM_SCHEME) {
-          try {
-            await vscode.window.tabGroups.close(tab, true);
-          } catch {
-            // Ignore close errors if tab already closed
-          }
-        }
-      }
-    }
-  }
-
-  private onSourceSelectionChanged(e: vscode.TextEditorSelectionChangeEvent) {
-    const adapter = this.getActiveAdapter();
-    if (!adapter || !adapter.isActive() || !adapter.isDisassemblyEnabled() || !this.currentDisasm) return;
-    if (e.textEditor.document.uri.scheme !== 'file') return;
-
-    const disasmEditor = vscode.window.visibleTextEditors.find(
-      (ed) => ed.document.uri.scheme === DISASM_SCHEME
+    const resolvedSource = path.resolve(sourcePath);
+    const firstGroup = (vscode.window.tabGroups?.all || []).find(
+      (g) => g.viewColumn === vscode.ViewColumn.One
     );
-    if (!disasmEditor) return;
+    const existingTab = firstGroup?.tabs.find((tab) => {
+      const input = tab.input as { uri?: vscode.Uri } | undefined;
+      return Boolean(input?.uri?.fsPath && path.resolve(input.uri.fsPath) === resolvedSource);
+    });
 
-    const rawPath = path.resolve(e.textEditor.document.uri.fsPath);
-    let realPath = rawPath;
-    try {
-      realPath = fs.realpathSync(rawPath);
-    } catch {
-      // Keep resolved path
-    }
-    const baseName = path.basename(rawPath);
-    const clickedLine = e.selections[0]?.active.line + 1;
-    if (!clickedLine) return;
-
-    const offsets = [0, 1, -1, 2, -2, 3, -3];
-    let targetLine: number | undefined;
-    for (const offset of offsets) {
-      const ln = clickedLine + offset;
-      if (ln < 1) continue;
-      targetLine =
-        this.currentDisasm.sourceToLine.get(`${realPath}:${ln}`) ??
-        this.currentDisasm.sourceToLine.get(`${rawPath}:${ln}`) ??
-        this.currentDisasm.sourceToLine.get(`${baseName}:${ln}`);
-      if (targetLine !== undefined) break;
-    }
-    if (targetLine === undefined) return;
-
-    this.currentCursorLine = targetLine;
-    this.applyDecorations();
-    const pos = new vscode.Position(targetLine, 0);
-    disasmEditor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-  }
-
-  private async ensureOpen(uri: vscode.Uri): Promise<vscode.TextEditor | undefined> {
-    const existingEditor = vscode.window.visibleTextEditors.find(
-      (ed) => ed.document.uri.scheme === DISASM_SCHEME
-    );
-    if (existingEditor) return existingEditor;
-
-    let targetColumn = vscode.ViewColumn.Beside;
-    for (const group of vscode.window.tabGroups?.all || []) {
-      for (const tab of group.tabs) {
-        const input = tab.input as { uri?: vscode.Uri } | undefined;
-        if (input?.uri?.scheme === DISASM_SCHEME) {
-          targetColumn = group.viewColumn;
-          break;
-        }
-      }
+    const line0 = Math.max(0, line - 1);
+    const key = `${stopSeq}:${frameId}:${resolvedSource}:${line0}`;
+    if (existingTab?.isActive && this.lastSyncedSourceKey === key) {
+      return;
     }
 
-    const doc = await vscode.workspace.openTextDocument(uri);
-    return vscode.window.showTextDocument(doc, {
-      viewColumn: targetColumn,
+    this.lastSyncedSourceKey = key;
+    const selection = new vscode.Range(line0, 0, line0, 0);
+    await vscode.window.showTextDocument(vscode.Uri.file(sourcePath), {
+      viewColumn: vscode.ViewColumn.One,
       preserveFocus: true,
       preview: false,
+      selection,
     });
   }
 
-  private applyDecorations() {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.scheme !== DISASM_SCHEME) continue;
-      if (!this.currentDisasm) {
-        editor.setDecorations(this.headerDecoration, []);
-        editor.setDecorations(this.sourceOverlayDecoration, []);
-        editor.setDecorations(this.pcDecoration, []);
-        editor.setDecorations(this.cursorSyncDecoration, []);
-        continue;
-      }
+  private async ensureDisassemblyInSecondPane(preserveDisassemblyFocus: boolean): Promise<void> {
+    const existing = this.findDisassemblyTab();
 
-      const toRanges = (lines: number[]) =>
-        lines
-          .filter((l) => l >= 0 && l < editor.document.lineCount)
-          .map((l) => new vscode.Range(l, 0, l, editor.document.lineAt(l).text.length));
+    // Fast path: already open in the second pane and currently on top.
+    if (existing && existing.group.viewColumn === vscode.ViewColumn.Two && existing.isActive) {
+      return;
+    }
 
-      editor.setDecorations(this.headerDecoration, toRanges(this.currentDisasm.headerLines));
-      editor.setDecorations(this.sourceOverlayDecoration, toRanges(this.currentDisasm.sourceLines));
-      editor.setDecorations(
-        this.pcDecoration,
-        this.currentPcLine !== undefined ? toRanges([this.currentPcLine]) : []
-      );
-      editor.setDecorations(
-        this.cursorSyncDecoration,
-        this.currentCursorLine !== undefined && this.currentCursorLine !== this.currentPcLine
-          ? toRanges([this.currentCursorLine])
-          : []
-      );
+    const openCmd = await this.resolveOpenCommand();
+
+    if (
+      existing &&
+      existing.group.viewColumn !== vscode.ViewColumn.Two &&
+      existing.group.viewColumn !== vscode.ViewColumn.One
+    ) {
+      // Present in a 3rd+ pane -> close so we re-open cleanly in the second pane.
+      await vscode.window.tabGroups.close(existing, true);
+    }
+
+    const moveFromFirstGroup = existing?.group.viewColumn === vscode.ViewColumn.One;
+    const hasSecondGroup = (vscode.window.tabGroups?.all || []).some(
+      (g) => g.viewColumn === vscode.ViewColumn.Two
+    );
+
+    if (!moveFromFirstGroup && hasSecondGroup) {
+      await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup');
+      await vscode.commands.executeCommand(openCmd);
+    } else {
+      await vscode.commands.executeCommand(openCmd);
+      await vscode.commands.executeCommand('workbench.action.moveEditorToNextGroup');
+    }
+
+    if (!preserveDisassemblyFocus) {
+      await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup');
     }
   }
 
-  private uriFor(elfFile: string): vscode.Uri {
-    return vscode.Uri.from({
-      scheme: DISASM_SCHEME,
-      path: `${elfFile}.disasm`,
-      query: `${path.basename(elfFile)} [Disassembly]`,
-    });
+  private async closeDisassemblyTab(): Promise<void> {
+    const tab = this.findDisassemblyTab();
+    if (!tab) return;
+    try {
+      await vscode.window.tabGroups.close(tab, true);
+    } catch {
+      // Ignore if already closed
+    }
   }
 
-  dispose() {
-    void this.closeAndClear();
-    for (const s of this.subscriptions) s.dispose();
-    this.headerDecoration.dispose();
-    this.sourceOverlayDecoration.dispose();
-    this.pcDecoration.dispose();
-    this.cursorSyncDecoration.dispose();
-    this.docChanged.dispose();
+  private async resolveOpenCommand(): Promise<string> {
+    if (this.openCommand) return this.openCommand;
+    try {
+      const cmds = await vscode.commands.getCommands(true);
+      if (cmds.includes('debug.action.openDisassemblyView')) {
+        this.openCommand = 'debug.action.openDisassemblyView';
+      } else if (cmds.includes('editor.debug.action.openDisassemblyView')) {
+        this.openCommand = 'editor.debug.action.openDisassemblyView';
+      }
+    } catch {
+      // Fall back to standard VS Code command id
+    }
+    return this.openCommand ?? 'debug.action.openDisassemblyView';
+  }
+
+  private findDisassemblyTab(): vscode.Tab | undefined {
+    for (const group of vscode.window.tabGroups?.all || []) {
+      for (const tab of group.tabs) {
+        const input = tab.input as { uri?: vscode.Uri } | undefined;
+        if (input?.uri?.scheme === 'disassembly' || tab.label === 'Disassembly') {
+          return tab;
+        }
+      }
+    }
+    return undefined;
   }
 }
 
 export function activate(context: vscode.ExtensionContext) {
   const views = new QemuDebugViews();
+  const disassembly = new BuiltinDisassemblyController();
   let activeAdapter: QemuDebugAdapter | undefined;
-  const disasmView = new DisassemblyViewController(() => activeAdapter);
 
   views.setActionHandler({
     onWriteRegister: async (name, value) => {
@@ -245,8 +184,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     views,
-    disasmView,
-    vscode.workspace.registerTextDocumentContentProvider(DISASM_SCHEME, disasmView),
     vscode.window.registerWebviewViewProvider('qemu-m3.registersView', views.registersProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
@@ -262,13 +199,18 @@ export function activate(context: vscode.ExtensionContext) {
           () => {
             if (activeAdapter === adapter) activeAdapter = undefined;
           },
-          () => void disasmView.syncOnStop(adapter),
-          () => disasmView.clearRunState(),
-          () => void disasmView.closeAndClear()
+          () => void disassembly.onStopped(adapter),
+          () => void disassembly.onTerminated()
         );
         activeAdapter = adapter;
         return new vscode.DebugAdapterInlineImplementation(adapter);
       },
+    }),
+
+    vscode.debug.onDidChangeActiveStackItem((item) => {
+      if (!activeAdapter || !item || !('frameId' in item)) return;
+      if (item.session.type !== 'qemu-m3') return;
+      void disassembly.onStopped(activeAdapter, item.frameId);
     }),
 
     vscode.commands.registerCommand('qemu-m3.refreshViews', async () => {
@@ -278,4 +220,4 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() { }

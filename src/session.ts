@@ -26,13 +26,12 @@ interface DAPRequest {
   arguments?: any;
 }
 
-export interface FullDisassembly {
-  elfFile: string;
-  text: string;
-  pcToLine: Map<string, number>;
-  sourceToLine: Map<string, number>;
-  sourceLines: number[];
-  headerLines: number[];
+interface DAPDisassembledInstruction {
+  address: string;
+  instruction: string;
+  symbol?: string;
+  location?: { name: string; path: string };
+  line?: number;
 }
 
 const LOCALS_SCOPE_REF = 1;
@@ -59,8 +58,10 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
   private suppressStopped = false;
   private stopWaiters: Array<() => void> = [];
   private breakpointsByFile = new Map<string, number[]>();
+  private instructionBreakpointIds: number[] = [];
   private registerNames: string[] = [];
-  private cachedDisassembly?: FullDisassembly;
+  private frameLocations = new Map<number, { path: string; line: number }>();
+  private stopSeq = 0;
   private activeFrameId = 0;
   private terminated = false;
   private disposed = false;
@@ -69,9 +70,8 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     private readonly views?: DebugViewSink,
     private readonly onDispose?: () => void,
     private readonly onStopped?: () => void,
-    private readonly onRunning?: () => void,
     private readonly onTerminated?: () => void
-  ) {}
+  ) { }
 
   handleMessage(message: vscode.DebugProtocolMessage) {
     const req = message as DAPRequest;
@@ -111,6 +111,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
             supportsConfigurationDoneRequest: true,
             supportsEvaluateForHovers: true,
             supportsDisassembleRequest: true,
+            supportsInstructionBreakpoints: true,
             supportsSteppingGranularity: true,
           });
           break;
@@ -131,7 +132,6 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           if (this.cfg.stopOnEntry === false) {
             await this.mi('exec-continue');
             this.status = 'Running';
-            this.onRunning?.();
           } else {
             this.stop('entry');
           }
@@ -146,7 +146,6 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
         case 'continue':
           await this.mi('exec-continue');
           this.status = 'Running';
-          this.onRunning?.();
           this.reply(m, { allThreadsContinued: true });
           break;
         case 'pause':
@@ -157,7 +156,6 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-next-instruction' : 'exec-next';
           await this.mi(cmd);
           this.status = 'Running';
-          this.onRunning?.();
           this.reply(m);
           break;
         }
@@ -165,18 +163,19 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
           const cmd = m.arguments?.granularity === 'instruction' ? 'exec-step-instruction' : 'exec-step';
           await this.mi(cmd);
           this.status = 'Running';
-          this.onRunning?.();
           this.reply(m);
           break;
         }
         case 'stepOut':
           await this.mi('exec-finish');
           this.status = 'Running';
-          this.onRunning?.();
           this.reply(m);
           break;
         case 'setBreakpoints':
           await this.handleSetBreakpoints(m);
+          break;
+        case 'setInstructionBreakpoints':
+          await this.handleSetInstructionBreakpoints(m);
           break;
         case 'stackTrace':
           await this.handleStackTrace(m);
@@ -215,7 +214,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private async start(attach: boolean) {
     this.terminated = false;
-    this.cachedDisassembly = undefined;
+    this.instructionBreakpointIds = [];
     this.root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
     const baseEnv = this.buildEnv();
     let makeVars: Record<string, string> | undefined;
@@ -622,6 +621,51 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.reply(m, { breakpoints: resultBreakpoints });
   }
 
+  private async handleSetInstructionBreakpoints(m: DAPRequest) {
+    const requested: Array<{ instructionReference: string; offset?: number; condition?: string }> =
+      m.arguments?.breakpoints || [];
+
+    const resultBreakpoints = await this.withTargetHalted(async () => {
+      if (this.instructionBreakpointIds.length > 0) {
+        try {
+          await this.mi(`break-delete ${this.instructionBreakpointIds.join(' ')}`);
+        } catch {
+          // Ignore already-deleted breakpoints
+        }
+      }
+
+      const newIds: number[] = [];
+      const out: Array<{ id?: number; verified: boolean; instructionReference?: string; message?: string }> = [];
+      for (const b of requested) {
+        const base = Number(b.instructionReference);
+        if (!Number.isFinite(base)) {
+          out.push({ verified: false, message: `Invalid instruction reference: ${b.instructionReference}` });
+          continue;
+        }
+        const targetAddr = ((base + (b.offset || 0)) >>> 0);
+        const addrHex = `0x${targetAddr.toString(16).padStart(8, '0')}`;
+        try {
+          const condFlag = b.condition ? `-c "${this.escapeMI(b.condition)}" ` : '';
+          const rec = await this.mi(`break-insert ${condFlag}*${addrHex}`);
+          const bkpt = this.asObject(rec.results.bkpt);
+          const id = bkpt?.number ? Number(this.asString(bkpt.number)) : undefined;
+          if (id !== undefined && !Number.isNaN(id)) newIds.push(id);
+          out.push({ id, verified: true, instructionReference: addrHex });
+        } catch (err) {
+          out.push({
+            verified: false,
+            instructionReference: addrHex,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      this.instructionBreakpointIds = newIds;
+      return out;
+    });
+
+    this.reply(m, { breakpoints: resultBreakpoints });
+  }
+
   private async handleStackTrace(m: DAPRequest) {
     const rec = await this.mi('stack-list-frames');
     const stackList = this.asArray(rec.results.stack);
@@ -640,7 +684,14 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
         instructionPointerReference: addr || undefined,
       };
     });
+    this.frameLocations.clear();
+    for (const sf of stackFrames) {
+      if (sf.source?.path && fs.existsSync(sf.source.path)) {
+        this.frameLocations.set(sf.id, { path: sf.source.path, line: Math.max(1, sf.line || 1) });
+      }
+    }
     this.reply(m, { stackFrames, totalFrames: stackFrames.length });
+    this.onStopped?.();
   }
 
   private async handleVariables(m: DAPRequest) {
@@ -807,199 +858,146 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
   private async handleDisassemble(m: DAPRequest) {
     const baseRef = String(m.arguments?.memoryReference || '$pc');
-    const offset = Number(m.arguments?.offset || 0);
+    const byteOffset = Number(m.arguments?.offset || 0);
+    const insnOffset = Number(m.arguments?.instructionOffset || 0);
     const count = Math.max(1, Number(m.arguments?.instructionCount || 32));
-    const startExpr = baseRef.startsWith('0x')
-      ? `0x${Math.max(0, parseInt(baseRef, 16) + offset).toString(16)}`
-      : baseRef;
-    const endExpr = startExpr.startsWith('0x')
-      ? `0x${(parseInt(startExpr, 16) + count * 4).toString(16)}`
-      : `${startExpr}+${count * 4}`;
 
-    const rec = await this.mi(`data-disassemble -s "${this.escapeMI(startExpr)}" -e "${this.escapeMI(endExpr)}" -- 0`);
-    const insns = this.asArray(rec.results.asm_insns).slice(0, count).map((item) => {
-      const obj = this.asObject(item);
-      return {
-        address: this.asString(obj?.address),
-        instruction: this.asString(obj?.inst).replace(/\t+/g, ' '),
-        symbol: this.asString(obj?.['func-name']) || undefined,
-      };
-    });
-    this.reply(m, { instructions: insns });
+    let baseAddr = Number(baseRef);
+    if (!Number.isFinite(baseAddr)) {
+      try {
+        const pcRec = await this.mi(`data-evaluate-expression "(unsigned int)${this.escapeMI(baseRef)}"`);
+        baseAddr = Number(this.asString(pcRec.results.value));
+      } catch {
+        baseAddr = NaN;
+      }
+    }
+    if (!Number.isFinite(baseAddr)) {
+      this.reply(m, { instructions: [] });
+      return;
+    }
+
+    const targetAddr = Math.max(0, (baseAddr + byteOffset) >>> 0) & ~1;
+    const forwardCount = insnOffset > 0 ? insnOffset + count : count;
+    const endAddr = (targetAddr + forwardCount * 4) >>> 0;
+
+    let after: DAPDisassembledInstruction[] = [];
+    try {
+      after = await this.disassembleRange(targetAddr, endAddr);
+    } catch {
+      try {
+        after = await this.disassembleRange(targetAddr, (targetAddr + count * 2) >>> 0);
+      } catch {
+        after = [];
+      }
+    }
+
+    let allInsns = after;
+    if (insnOffset < 0 && targetAddr > 0) {
+      const startAddr = Math.max(0, targetAddr - Math.abs(insnOffset) * 4) & ~1;
+      let before: DAPDisassembledInstruction[] = [];
+      try {
+        before = await this.disassembleRange(startAddr, targetAddr);
+        // If startAddr landed in unmapped/vector data, GDB omits src_and_asm_line for the whole chunk;
+        // re-disassemble from the first function entry inside [startAddr, targetAddr) to restore source lines.
+        if (before.length > 0 && !before.some((i) => i.location)) {
+          const firstSym = before[0].symbol;
+          const codeEntry = before.find((i) => i.symbol && i.symbol !== firstSym);
+          if (codeEntry) {
+            const codeStart = Number(codeEntry.address);
+            if (Number.isFinite(codeStart) && codeStart < targetAddr) {
+              const withSrc = await this.disassembleRange(codeStart, targetAddr);
+              const prefix = before.filter((i) => Number(i.address) < codeStart);
+              before = [...prefix, ...withSrc];
+            }
+          }
+        }
+      } catch {
+        before = [];
+      }
+      const seen = new Set(before.map((i) => i.address));
+      allInsns = [...before, ...after.filter((i) => !seen.has(i.address))];
+    }
+
+    let sliced: DAPDisassembledInstruction[];
+    if (insnOffset < 0) {
+      const targetIdx = allInsns.findIndex((i) => Number(i.address) >= targetAddr);
+      const anchor = targetIdx >= 0 ? targetIdx : allInsns.length;
+      const startIdx = Math.max(0, anchor + insnOffset);
+      sliced = allInsns.slice(startIdx, startIdx + count);
+    } else {
+      const startIdx = Math.min(allInsns.length, insnOffset);
+      sliced = allInsns.slice(startIdx, startIdx + count);
+    }
+
+    this.reply(m, { instructions: sliced });
+  }
+
+  private async disassembleRange(startAddr: number, endAddr: number): Promise<DAPDisassembledInstruction[]> {
+    const startHex = `0x${(startAddr >>> 0).toString(16)}`;
+    const endHex = `0x${(endAddr >>> 0).toString(16)}`;
+    const rec = await this.mi(`data-disassemble -s "${startHex}" -e "${endHex}" -- 4`);
+    const out: DAPDisassembledInstruction[] = [];
+
+    const pushInsn = (asm: MIObject, location?: { name: string; path: string }, line?: number) => {
+      const addr = this.asString(asm.address);
+      const inst = this.asString(asm.inst).replace(/\t+/g, ' ').trim();
+      if (!addr || !inst) return;
+      const symbol = this.asString(asm['func-name']) || undefined;
+      out.push({
+        address: addr,
+        instruction: inst,
+        symbol,
+        location,
+        line,
+      });
+    };
+
+    for (const entry of this.asArray(rec.results.asm_insns)) {
+      const group = this.asObject(entry);
+      const src = group?.src_and_asm_line ? this.asObject(group.src_and_asm_line) : undefined;
+      if (src) {
+        const rawFile = this.asString(src.fullname) || this.asString(src.file);
+        const lineNo = Number(this.asString(src.line));
+        const filePath = rawFile ? path.resolve(this.root, rawFile) : '';
+        const location = filePath ? { name: path.basename(filePath), path: filePath } : undefined;
+        const line = Number.isFinite(lineNo) && lineNo > 0 ? lineNo : undefined;
+        for (const item of this.asArray(src.line_asm_insn)) {
+          const asm = this.asObject(item);
+          if (asm) pushInsn(asm, location, line);
+        }
+      } else if (group) {
+        pushInsn(group);
+      }
+    }
+
+    return out;
   }
 
   isDisassemblyEnabled(): boolean {
     return this.cfg?.disassembly !== false;
   }
 
-  isActive(): boolean {
-    return !this.terminated && this.status !== 'Disconnected';
+  getStopSeq(): number {
+    return this.stopSeq;
   }
 
-  isStopped(): boolean {
-    return this.status === 'Stopped' && !this.terminated;
-  }
-
-  async getCurrentPc(): Promise<string | undefined> {
-    if (!this.isStopped()) return undefined;
-    try {
-      const pcRec = await this.mi('data-evaluate-expression "(unsigned int)$pc"');
-      const pcNumber = Number(this.asString(pcRec.results.value));
-      if (!Number.isFinite(pcNumber)) return undefined;
-      return `0x${(pcNumber >>> 0).toString(16).padStart(8, '0')}`;
-    } catch {
-      return undefined;
-    }
-  }
-
-  async getFullDisassembly(): Promise<FullDisassembly | undefined> {
-    if (!this.isDisassemblyEnabled() || !this.cfg?.elfFile || this.terminated) return undefined;
-    if (this.cachedDisassembly) return this.cachedDisassembly;
-
-    const objdump = this.findObjdumpBinary();
-    const env = this.buildEnv();
-    const raw = await new Promise<string>((resolve, reject) => {
-      cp.execFile(
-        objdump,
-        ['-d', '-S', '-l', this.cfg.elfFile!],
-        { cwd: this.root, env, maxBuffer: 32 * 1024 * 1024 },
-        (err, stdout) => {
-          if (err) reject(err);
-          else resolve(stdout);
-        }
-      );
-    });
-
-    this.cachedDisassembly = this.parseObjdump(raw, this.cfg.elfFile);
-    return this.cachedDisassembly;
-  }
-
-  private findObjdumpBinary(): string {
-    const gdbPath = this.cfg.gdbPath || '';
-    if (gdbPath.endsWith('-gdb')) {
-      const sibling = gdbPath.slice(0, -4) + '-objdump';
-      if (fs.existsSync(sibling)) return sibling;
-    }
-    return this.findBinary('arm-none-eabi-objdump');
-  }
-
-  private parseObjdump(raw: string, elfFile: string): FullDisassembly {
-    const outLines: string[] = [];
-    const pcToLine = new Map<string, number>();
-    const sourceToLine = new Map<string, number>();
-    const sourceByName = new Map<string, Set<string>>();
-    const sourceLines: number[] = [];
-    const headerLines: number[] = [];
-
-    const canonical = (p: string) => {
-      const resolved = path.resolve(this.root, p);
-      try {
-        return fs.realpathSync(resolved);
-      } catch {
-        return resolved;
-      }
-    };
-
-    const recordSource = (filePath: string, lineNo: number, targetLine: number) => {
-      const key = `${filePath}:${lineNo}`;
-      if (!sourceToLine.has(key)) sourceToLine.set(key, targetLine);
-      const base = path.basename(filePath);
-      if (!sourceByName.has(base)) sourceByName.set(base, new Set());
-      sourceByName.get(base)!.add(filePath);
-    };
-
-    let pendingSource: { file: string; line: number } | undefined;
-    let inSection = false;
-
-    for (const line of raw.split(/\r?\n/)) {
-      if (!line && !inSection) continue;
-      if (line.startsWith('Disassembly of section ')) {
-        inSection = true;
-        pendingSource = undefined;
-        if (outLines.length > 0) outLines.push('');
-        outLines.push(line);
-        headerLines.push(outLines.length - 1);
-        continue;
-      }
-      if (!inSection) continue;
-
-      const headerMatch = line.match(/^([0-9a-fA-F]+)\s+<([^>]+)>:$/);
-      if (headerMatch) {
-        pendingSource = undefined;
-        if (outLines.length > 0 && outLines[outLines.length - 1] !== '') outLines.push('');
-        const addr = `0x${(parseInt(headerMatch[1], 16) >>> 0).toString(16).padStart(8, '0')}`;
-        outLines.push(`${addr} <${headerMatch[2]}>:`);
-        headerLines.push(outLines.length - 1);
-        continue;
-      }
-
-      const insnMatch = line.match(/^\s*([0-9a-fA-F]+):\s+[0-9a-fA-F ]+?\t(.*)$/);
-      if (insnMatch) {
-        const addr = `0x${(parseInt(insnMatch[1], 16) >>> 0).toString(16).padStart(8, '0')}`;
-        const inst = insnMatch[2].replace(/\t+/g, ' ').replace(/\s+/g, ' ').trim();
-        const lineIdx = outLines.length;
-        outLines.push(`    ${addr}  ${inst}`);
-        pcToLine.set(addr, lineIdx);
-        if (pendingSource) {
-          recordSource(pendingSource.file, pendingSource.line, lineIdx);
-        }
-        continue;
-      }
-
-      const locMatch = line.match(/^(.+?):(\d+)(?:\s+\(discriminator\s+\d+\))?$/);
-      if (locMatch && /\.(?:c|cc|cpp|cxx|h|hpp|s|S|asm)$/i.test(locMatch[1])) {
-        pendingSource = { file: canonical(locMatch[1]), line: Number(locMatch[2]) };
-        continue;
-      }
-
-      if (/^[A-Za-z_][A-Za-z0-9_]*\(\):$/.test(line.trim())) {
-        continue;
-      }
-
-      if (pendingSource && line.length > 0) {
-        const lineIdx = outLines.length;
-        outLines.push(`  ; ${String(pendingSource.line).padStart(3)} | ${line}`);
-        sourceLines.push(lineIdx);
-        recordSource(pendingSource.file, pendingSource.line, lineIdx);
-      } else if (line === '...') {
-        outLines.push('    ...');
-      }
-    }
-
-    // Add basename fallback keys when a filename maps uniquely in the ELF
-    for (const [base, paths] of sourceByName) {
-      if (paths.size !== 1) continue;
-      const [onlyPath] = paths;
-      const prefix = `${onlyPath}:`;
-      for (const [k, v] of sourceToLine) {
-        if (k.startsWith(prefix)) {
-          const linePart = k.slice(prefix.length);
-          const baseKey = `${base}:${linePart}`;
-          if (!sourceToLine.has(baseKey)) sourceToLine.set(baseKey, v);
-        }
-      }
-    }
-
-    return {
-      elfFile,
-      text: outLines.join('\n'),
-      pcToLine,
-      sourceToLine,
-      sourceLines,
-      headerLines,
-    };
+  getSourceLocation(frameId = 0): { path: string; line: number } | undefined {
+    return this.frameLocations.get(frameId) ?? this.frameLocations.values().next().value;
   }
 
   private stop(reason: string) {
     this.status = 'Stopped';
+    this.stopSeq++;
+    this.frameLocations.clear();
     void this.refreshPeripheralViews();
-    this.onStopped?.();
     this.sendEvent('stopped', { reason, threadId: 1, allThreadsStopped: true });
+    this.onStopped?.();
   }
 
   private end() {
     if (this.terminated) return;
     this.terminated = true;
+    this.frameLocations.clear();
     this.stopQmpLedMonitor();
     this.rejectAllPending(new Error('Debug session terminated'));
     if (this.gdb?.pid) treeKill(this.gdb.pid, 'SIGTERM', () => undefined);
@@ -1007,7 +1005,6 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
     this.gdb = undefined;
     this.qemu = undefined;
     this.status = 'Disconnected';
-    this.cachedDisassembly = undefined;
     this.views?.clearSession();
     this.onTerminated?.();
     this.sendEvent('terminated');
@@ -1043,7 +1040,7 @@ export class QemuDebugAdapter implements vscode.DebugAdapter {
 
     sock.on('data', (chunk) => {
       buf += chunk.toString();
-      for (;;) {
+      for (; ;) {
         const nl = buf.indexOf('\n');
         if (nl < 0) break;
         const line = buf.slice(0, nl).trim();

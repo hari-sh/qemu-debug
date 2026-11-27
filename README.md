@@ -1,77 +1,22 @@
 # qemu-debug
 
-VS Code debugging extension for ARM Cortex-M3 firmware running on QEMU (`mps2-an385`), built on GDB/MI2 and QEMU Monitor Protocol (QMP).
+VS Code debugging extension for ARM Cortex-M3 firmware running on QEMU (`mps2-an385`), built on GDB/MI2 and QMP.
 
 ## Features
 
-- **Launch & Attach Debugging**
-  - Spawns `qemu-system-arm` (`-S -gdb`, `-kernel`) and `arm-none-eabi-gdb` (`--interpreter=mi2`), or attaches to an already-running QEMU GDB server.
-  - Breakpoints (including conditional breakpoints and live breakpoint updates while running), step over/in/out, instruction-level stepping, pause (`SIGINT`), call stack, locals, watch/hover evaluation, and Debug Console (prefix commands with `>` to run raw GDB console commands).
-- **Registers View + Live LED Strip**
-  - **Live 8-LED Strip**: Pinned at the top of the **Registers** tab and active only while debugging. Polls `ledRegister` over QEMU QMP every `60ms` so LEDs update in real time **whether the target is running or paused** without halting the CPU (falls back to GDB reads on stop in `attach` mode).
-  - **Two-Column CPU Registers**: Displays Cortex-M3 registers (`r0`–`r12`, `sp`, `lr`, `pc`, `xpsr`, `msp`, `psp`, `ctrl`, `pmask`, `fmask`, `bpri`) in a compact two-column layout with inline click-to-edit (`Enter` or click outside to commit, `Escape` to cancel).
-- **Memory View**
-  - Defaults to `0x00000000` and shows **10 rows** (`80` bytes total), incrementing by `+8` bytes per row with two 4-byte words (`addr: word0  word1`).
-  - Includes an inline start-address bar (`Enter` or **Read**) and inline click-to-edit on any 4-byte word (`Enter` or click outside to commit, `Escape` to cancel).
-- **Full Mixed Source & Disassembly View**
-  - Controlled by `"disassembly": true` in `launch.json` (enabled by default; set `"disassembly": false` to disable).
-  - Opens a read-only full disassembly file (`qemu-disasm`) beside your C source **only while debugging** (closes automatically when the debug session ends), interleaving source lines right above their instructions (`arm-none-eabi-objdump -d -S -l`).
-  - Automatically highlights and scrolls to the active `$pc` instruction on every breakpoint, step, or pause, and syncs when you click lines in your C source while stopped.
-- **`Makefile` Variable Resolution (`${make:VAR}`)**
-  - Runs `buildCommand` before launch and resolves `${make:VAR}` placeholders directly from the workspace `Makefile` (including nested variables such as `TARGET = $(BUILD_DIR)/rtos.elf`).
-
----
+- **Launch & Attach Debugging**: Spawns `qemu-system-arm` (`-S -gdb`, `-kernel`) and `arm-none-eabi-gdb` (`--interpreter=mi2`), or attaches to a running QEMU GDB server. Supports breakpoints (conditional and while running), stepping, pause, call stack, locals, hover/watch evaluation, and Debug Console (prefix raw GDB commands with `>`).
+- **Registers & Live 8-LED Strip**: Compact two-column Cortex-M3 register view with inline click-to-edit (`Enter` or blur to apply, `Escape` to cancel), plus a pinned 8-LED strip polled via QMP every `60ms` while running (or GDB fallback on stop in `attach` mode).
+- **Memory View**: Shows 10 eight-byte rows (`0x00000000` default) with start-address navigation and inline click-to-edit on any 4-byte word.
+- **Side-by-Side Disassembly View**: Controlled by `"disassembly": true` in `launch.json` (enabled by default; set `"disassembly": false` to turn off). Keeps the active source file on top in the first pane and VS Code's built-in Disassembly View (address + mnemonics with C source overlay, assembly breakpoints, and instruction stepping) on top in the second pane, closing Disassembly when the session ends.
+- **`Makefile` Interpolation (`${make:VAR}`)**: Runs `buildCommand` before launch and resolves `${make:VAR}` placeholders from the workspace `Makefile`.
 
 ## Prerequisites
 
 - **VS Code** `>= 1.85.0`
 - **QEMU**: `qemu-system-arm`
-- **ARM GNU Toolchain**: `arm-none-eabi-gdb` (and `arm-none-eabi-gcc` + `make` to build firmware)
+- **ARM GNU Toolchain**: `arm-none-eabi-gdb`
 
-On macOS (Homebrew):
-
-```sh
-brew install qemu arm-none-eabi-gcc arm-none-eabi-gdb
-```
-
----
-
-## Quick Start
-
-### 1. Firmware `Makefile`
-
-Compile with `-O0 -g` for full source-level debugging and disassembly, and define the variables referenced by `launch.json`:
-
-```makefile
-CC           = arm-none-eabi-gcc
-GDB          = arm-none-eabi-gdb
-QEMU         = qemu-system-arm
-QEMU_MACH    = mps2-an385
-LED_ADDR     = 0x40028000
-
-PLATFORM_DIR = ../platform
-BUILD_DIR    = build
-TARGET       = $(BUILD_DIR)/rtos.elf
-
-CFLAGS       = -mcpu=cortex-m3 -mthumb -ffreestanding -O0 -g -Wall -I. -Ibsp -I$(PLATFORM_DIR)
-LDFLAGS      = -T $(PLATFORM_DIR)/linker.ld -nostartfiles -nostdlib
-SRCS         = $(PLATFORM_DIR)/startup.c main.c
-
-all: $(TARGET)
-
-$(TARGET): $(SRCS) $(PLATFORM_DIR)/linker.ld $(PLATFORM_DIR)/mps2_an385.h
-	mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(SRCS) -o $(TARGET)
-
-clean:
-	rm -rf $(BUILD_DIR)
-
-.PHONY: all clean
-```
-
-### 2. `.vscode/launch.json`
-
-Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (see [`sample/.vscode/launch.json`](sample/.vscode/launch.json)):
+## `.vscode/launch.json`
 
 ```json
 {
@@ -94,18 +39,7 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 }
 ```
 
-> **Note:** `${make:VAR}` reads variables from the `Makefile` in `${workspaceFolder}` (or the `-C <dir>` directory in `buildCommand`). If a referenced variable is missing from the `Makefile`, launch fails with a clear error naming the missing variable.
-
-### 3. Debug
-
-1. Open your firmware workspace and press **F5** (**Run and Debug → Debug Firmware**).
-2. In the **Run and Debug** sidebar:
-   - **Registers**: View the live 8-LED strip at the top and edit registers inline by clicking any hex value (`Enter` or click outside to apply, `Escape` to cancel).
-   - **Memory**: Enter any hex/decimal address and press `Enter` or **Read** to inspect 10 eight-byte rows; click either 4-byte word on a row to edit memory inline.
-3. With `"disassembly": true`, the full mixed Disassembly tab opens beside your source file while stopped—highlighting the active `$pc` instruction on breakpoints/steps and scrolling when you click lines in C source. It closes automatically when debugging ends.
-4. In the **Debug Console**, evaluate C expressions directly or prefix raw GDB commands with `>` (for example, `>info breakpoints`).
-
----
+`${make:VAR}` reads variables from the `Makefile` in `${workspaceFolder}` (or the `-C <dir>` directory in `buildCommand`).
 
 ## Configuration Reference
 
@@ -115,16 +49,16 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 | --- | --- | --- | --- |
 | `type` | Yes | — | Must be `"qemu-m3"` |
 | `request` | Yes | — | `"launch"` |
-| `name` | Yes | — | Configuration name shown in VS Code |
+| `name` | Yes | — | Configuration name |
 | `elfFile` | Yes | — | Path to compiled `.elf` firmware (supports `${workspaceFolder}` and `${make:VAR}`) |
 | `qemuPath` | No | `qemu-system-arm` | Path or binary name for QEMU |
 | `gdbPath` | No | `arm-none-eabi-gdb` | Path or binary name for ARM GDB |
 | `gdbPort` | No | `3333` | TCP port for QEMU GDB server |
 | `machine` | No | `mps2-an385` | QEMU `-M` machine name |
-| `buildCommand` | No | — | Shell command run before starting QEMU (e.g. `"make -C ${workspaceFolder}"`) |
+| `buildCommand` | No | — | Shell command run before starting QEMU |
 | `ledRegister` | No | `0x40028000` | 32-bit MMIO address monitored for the 8-LED strip |
 | `stopOnEntry` | No | `true` | Halt at `Reset_Handler` on start (`false` continues immediately) |
-| `disassembly` | No | `true` | Open full mixed source/disassembly view while debugging |
+| `disassembly` | No | `true` | Keep source and Disassembly View open side-by-side while debugging |
 
 ### `attach`
 
@@ -136,17 +70,13 @@ Add a `qemu-m3` configuration to your firmware workspace `.vscode/launch.json` (
 | `elfFile` | No | — | Path to `.elf` symbols file |
 | `gdbPath` | No | `arm-none-eabi-gdb` | Path or binary name for ARM GDB |
 | `gdbPort` | No | `3333` | TCP port of the running QEMU GDB server |
-| `disassembly` | No | `true` | Open full mixed source/disassembly view while debugging |
+| `disassembly` | No | `true` | Keep source and Disassembly View open side-by-side while debugging |
 
----
-
-## Development & Packaging
+## Development
 
 ```sh
 npm install
 npm test        # Type-check (tsc --noEmit) and bundle (esbuild)
 npm run watch   # Rebuild on changes
-npm run package # Build qemu-debug-<version>.vsix via vsce
+npm run package # Build .vsix via vsce
 ```
-
-To run locally in VS Code, press **F5** (**Run qemu-debug Extension**), or install the packaged `.vsix` via **Extensions → `...` → Install from VSIX...** (or `code --install-extension qemu-debug-0.1.1.vsix`).
